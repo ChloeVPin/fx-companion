@@ -1,6 +1,27 @@
 # fx-companion
 
-A native acceleration layer for [fx](https://github.com/vercel-labs/fx) on Apple silicon.
+**Boosted [fx](https://github.com/vercel-labs/fx) for Apple Silicon — stock output, faster traversal.**
+
+## Quick start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ChloeVPin/fx-companion/main/bootstrap.sh | sh
+```
+
+Requires macOS on arm64 and Zig (`brew install zig`). The installer builds fx,
+self-tests boosted-vs-stock output equivalence, and refuses to install anything
+that isn't byte-identical. Then:
+
+```sh
+export PATH="$HOME/.fx-companion/bin:$PATH"   # add to ~/.zshrc
+fx                                            # looks like fx, runs boosted
+FX_NO_COMPANION=1 fx ...                      # pure stock, anytime
+~/.fx-companion/fxc sync                      # re-boost after any `fx upgrade`
+```
+
+---
+
+A native acceleration layer for fx on Apple silicon.
 User-space companion daemon plus benchmark suite. Experimental research prototype.
 
 Read [PLAN.md](PLAN.md) for goals, corrected claims, and the phased roadmap.
