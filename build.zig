@@ -4,6 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Shared traversal library: getattrlistbulk walker, used by both the
+    // daemon (walk RPC) and the benchmark. Needs libc for open/close.
+    const walklib_mod = b.createModule(.{
+        .root_source_file = b.path("benchmarks/bulk_walk.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     // fx-companiond daemon
     const daemon_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -11,6 +20,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    daemon_mod.addImport("walklib", walklib_mod);
     const daemon = b.addExecutable(.{
         .name = "fx-companiond",
         .root_module = daemon_mod,
@@ -29,6 +39,20 @@ pub fn build(b: *std.Build) void {
         .root_module = latency_mod,
     });
     b.installArtifact(latency);
+
+    // walkrpc client: ask the daemon to walk a directory tree.
+    const walkrpc_mod = b.createModule(.{
+        .root_source_file = b.path("src/walkrpc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    walkrpc_mod.addImport("walklib", walklib_mod);
+    const walkrpc = b.addExecutable(.{
+        .name = "walkrpc",
+        .root_module = walkrpc_mod,
+    });
+    b.installArtifact(walkrpc);
 
     // traversal benchmark (Zig + one C source for the fts wrapper)
     const bench_mod = b.createModule(.{

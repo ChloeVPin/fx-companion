@@ -31,14 +31,17 @@ pub const WalkOut = shared.WalkOut;
 const BUF_SIZE: usize = 128 * 1024; // healeycodes found this optimal
 
 fn makeAttrlist() c.attrlist {
+    // ATTR_CMN_ERROR is deliberately NOT requested: on current macOS it makes
+    // getattrlistbulk reject mixed common+file requests with EINVAL in the
+    // per-entry error slot, zeroing the file-group fields (datalen). The
+    // returned-attrs bitmap is checked instead.
     return .{
         .bitmapcount = c.ATTR_BIT_MAP_COUNT,
         .reserved = 0,
         .commonattr = c.ATTR_CMN_RETURNED_ATTRS |
             c.ATTR_CMN_NAME |
             c.ATTR_CMN_OBJTYPE |
-            c.ATTR_CMN_FILEID |
-            c.ATTR_CMN_ERROR,
+            c.ATTR_CMN_FILEID,
         .volattr = 0,
         .dirattr = 0,
         .fileattr = c.ATTR_FILE_DATALENGTH,
@@ -93,6 +96,7 @@ fn walkCommon(root: []const u8, sum_sizes: bool) !WalkOut {
 
     var entries: u64 = 0;
     var bytes: u64 = 0;
+    var truncated = false;
 
     while (top > 0) {
         top -= 1;
@@ -101,7 +105,7 @@ fn walkCommon(root: []const u8, sum_sizes: bool) !WalkOut {
         const cur = getDir(idx);
         cur[cur_len] = 0;
         cur_z: {
-            const dfd = c.open(@ptrCast(cur), c.O_RDONLY);
+            const dfd = c.open(@ptrCast(cur), c.O_RDONLY | c.O_NONBLOCK);
             if (dfd < 0) break :cur_z;
             defer _ = c.close(dfd);
 
@@ -116,19 +120,20 @@ fn walkCommon(root: []const u8, sum_sizes: bool) !WalkOut {
                     const entry_len = rdU32(rec);
                     if (entry_len == 0 or p + entry_len > BUF_SIZE) break;
 
-                    // Fixed layout for this fixed request (verified by hexdump):
+                    // Fixed layout for this fixed request (verified by
+                    // hexdump, macOS 27/arm64, WITHOUT ATTR_CMN_ERROR):
                     //   +0x00 u32 entry_len
                     //   +0x04 attribute_set_t (20 B)
                     //   +0x18 attrreference_t NAME (dataoffset relative to +0x18)
                     //   +0x20 u32 objtype
-                    //   +0x28 u64 fileid        (4-byte pad before)
-                    //   +0x30 u64 datalen       (files only)
-                    //   name blob inline; record padded to 8.
+                    //   +0x24 u64 fileid        (packed tight, no pad)
+                    //   +0x2C u64 datalen       (files only)
+                    //   name blob inline at +0x18+off; record padded to 8.
                     const ref_addr = p + 0x18;
                     const off = rdI32(rec + 0x18);
                     const ln = rdU32(rec + 0x1C);
                     const obj_type = rdU32(rec + 0x20);
-                    const datalen = rdU64(rec + 0x30);
+                    const datalen = rdU64(rec + 0x2C);
 
                     var name: []const u8 = "";
                     if (ln > 0) {
@@ -157,7 +162,12 @@ fn walkCommon(root: []const u8, sum_sizes: bool) !WalkOut {
                                 dirs_seen += 1;
                                 stack[top] = dirs_seen - 1;
                                 top += 1;
+                            } else {
+                                truncated = true;
                             }
+                        } else if (obj_type == 2) {
+                            // Directory table or stack full: tree not fully covered.
+                            truncated = true;
                         }
                     }
 
@@ -167,5 +177,5 @@ fn walkCommon(root: []const u8, sum_sizes: bool) !WalkOut {
         }
     }
 
-    return .{ .entries = entries, .bytes_sum = bytes };
+    return .{ .entries = entries, .bytes_sum = bytes, .truncated = truncated };
 }

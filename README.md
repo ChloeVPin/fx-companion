@@ -20,8 +20,16 @@ Weeks 1-2 skeleton:
   launchd owns `dev.fx.companion`, spawns the daemon at first Mach lookup,
   and nothing runs until then.
 - `latency`: client measuring round-trip latency against the running daemon.
+- `walkrpc`: asks the daemon to walk a directory tree (MSG_WALK RPC) and
+  cross-checks the reply against an in-process run of the same walker.
 - `benchmarks/traversal_bench`: fts vs readdir vs getattrlistbulk shootout
   over a synthetic tree (name-only and attribute-heavy modes).
+
+Walk RPC notes: walks execute on a worker thread, so a blocked `open()`
+(macOS TCC consent on Downloads/Documents/Desktop can stall indefinitely for
+launchd-spawned processes) never wedges the service; concurrent requests get
+an immediate busy status. The walker's fixed 8192-directory table reports a
+truncated status instead of silently dropping directories.
 
 ## Build
 
@@ -85,6 +93,11 @@ Traversal, synthetic tree of 128 dirs x 256 files (32,896 entries,
 | fts             | 29.5 ms  | 31.4 ms  |
 | readdir+lstat   | 13.0 ms  | 68.8 ms  |
 | getattrlistbulk | 26.0 ms  | 26.1 ms  |
+
+Walk RPC over the daemon (repo tree, 408 entries / 321 MB): 12.7 ms walk,
+12.8 ms round trip - the Mach hop adds under 1% on real workloads.
+`/opt/homebrew` (15k dirs) completes in 3.1 s with a truncated status;
+counts are lower bounds past the walker's directory-table cap.
 
 Early signals consistent with tempel.org's finding that no single syscall
 wins everywhere: readdir is fastest name-only here, while bulk wins once

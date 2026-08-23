@@ -7,6 +7,9 @@ const std = @import("std");
 pub const WalkOut = struct {
     entries: u64,
     bytes_sum: u64,
+    /// True when the fixed 8192-directory table filled before the tree
+    /// ended; counts are then lower bounds, not totals.
+    truncated: bool = false,
 };
 
 extern "c" fn fts_walk(
