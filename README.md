@@ -33,6 +33,38 @@ concurrent requests get an immediate busy status. There is no fixed
 directory cap; the walk covers the whole tree and reports a truncated flag
 only if an allocation fails.
 
+## Product: boosted fx (in-process hook)
+
+The daemon path was dropped from the product: the in-process hook is strictly
+faster (no IPC hop, no launchd cold-start penalty). `product/` contains the
+shippable booster:
+
+- `fx_companion.zig` — the accelerator module (8-worker getdirentries pool,
+  128 KB buffers, pthread sync). Byte-identical output to stock fx, verified
+  by `tests_fxcompanion.zig` on three trees (tiny known tree with symlinks,
+  hidden files and node_modules; the 409,600-file anchor; `/opt/homebrew`),
+  both targets, repeated runs.
+- `inject_hook.py` — idempotently injects the hook into an fx source tree;
+  fails loudly if upstream anchors changed.
+- `install.sh` — one command: payload to `~/.fx-companion`, clone fx, inject,
+  build ReleaseFast, run the equivalence self-test (refuses to install on any
+  mismatch), install to `~/.fx-companion/bin/fx`.
+- `fxc` — `fxc sync` re-applies the booster after any `fx upgrade`
+  (fetch latest stock source, inject, rebuild); `fxc status` reports whether
+  the fx on PATH carries the booster.
+
+Stock behavior anytime: `FX_NO_COMPANION=1 fx ...`.
+
+### Measured (Apple Silicon macOS, ReleaseFast, medians)
+
+| Surface | stock fx | boosted | speedup |
+|---|---|---|---|
+| `discover()` end-to-end, 409,600 files | 1,589-1,685 ms | 347-533 ms | 3.2-4.6x |
+| Equivalence probe walker, anchor | 1,761-2,767 ms | 156-297 ms | 5.9-17.7x |
+| Raw walker (gate bench) | 213 ms | 104 ms | 2.05x |
+
+Output byte-identical in every case (`IDENTICAL` on files and dirs targets).
+
 ## Build
 
 Requires Zig 0.16+ and macOS on arm64.
