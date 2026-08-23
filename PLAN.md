@@ -96,7 +96,7 @@ maintenance risk. For the eval/gym workload prefer per-user isolation or VM snap
 - **Weeks 1-2 Foundation** (current): Zig XPC service as on-demand LaunchAgent,
   audit-token validation, health endpoint, round-trip latency client, cold start + RSS measured.
 - **Week 3 Traversal**: live shootout harness, winners implemented, fx paths instrumented first.
-- **Week 4 ZeroCopyState**: layout, atomics, ownership regions, one migrated object, zero-copy proof.
+- **Week 4 ZeroCopyState**: layout, atomics, ownership regions, one migrated object, zero-copy proof (done: shm region + daemon RPCs in `src/zcs.zig`, cross-process hand-off verified; verdict in README - 31x at 4 KB control-plane state, loses to pipes at >=256 KB bulk transfer because of double CRC+memcpy).
 - **Week 5 AMX spike**: flag-gated, NEON kill rule enforced.
 - **Week 6+ Speculative predictor**: Pattern Tuples + policies; ANE appendix only.
 

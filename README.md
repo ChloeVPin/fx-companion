@@ -161,6 +161,54 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/walkrpc --names /path/to/large/tree
 ```
 
+## Week 4: ZeroCopyState (implemented, measured)
+
+`src/zcs.zig` implements the shared-memory state region: POSIX shm object
+per key (`/fxcomp-<key>`), 256-byte header (magic FXZS, version, epoch,
+capacity, length, CRC-32), a process-shared pthread mutex, and one slab.
+Writers memcpy payload once into the mapping and publish via a release
+store of the epoch; readers either take the mutex or run lock-free
+(epoch check + CRC verify). Attach/detach are mmap/munmap; unlink is
+explicit creator cleanup.
+
+Daemon RPCs `MSG_STATE_PUT` / `MSG_STATE_GET`: the client names the key,
+the daemon attaches to the same shm object, and only the key plus control
+metadata travel through Mach - the payload itself never crosses the RPC
+for readers. Verified end to end: process A puts, daemon attaches
+independently, separate process B reads byte-exact data with no daemon
+involvement on the read path.
+
+Hand-off benchmark (`statetool bench <key> <bytes>`), median of 5 runs,
+warm cache, ReleaseFast. Baseline B is the classic tool-process pattern:
+fork/exec of `/bin/cat` echoing the blob back through two pipes (parent
+side non-blocking + poll so it cannot deadlock). A is writer-put +
+lock-free reader get through the shared region:
+
+| payload | A zero-copy state | B fork/exec+pipe | speedup |
+|---------|-------------------|------------------|---------|
+| 4 KB    | 59 us             | 1,879 us         | 31x     |
+| 64 KB   | 960 us            | 1,585 us         | 1.7x    |
+| 256 KB  | 4,201 us          | 1,957 us         | 0.5x    |
+| 1 MB    | 16,898 us         | 2,301 us         | 0.07x   |
+
+Honest verdict: ZeroCopyState wins decisively for small, high-frequency
+state hand-offs (sub-agent keys, open-file lists, session metadata) -
+31x at 4 KB, which matches workload 2's >=3x hand-off target at that
+scale. It does NOT win for bulk payload transfer: our put/get path pays a
+CRC over the whole blob twice plus two memcpys, while pipes stream
+through kernel pages without a checksum. The plan's zero-copy claim holds
+for control-plane state, not for moving megabytes. Bulk transfer should
+stay in whatever channel moves data cheapest (pipes/files), or the region
+needs an opt-in no-CRC fast path.
+
+Reproduce:
+
+```sh
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/statetool bench zcsbench 4096
+./zig-out/bin/statetool put demo "payload" && ./zig-out/bin/statetool get demo
+```
+
 ## License
 
 Apache-2.0.

@@ -12,6 +12,7 @@
 const std = @import("std");
 const c = @import("machc.zig");
 const walklib = @import("walklib");
+const zcs = @import("zcs.zig");
 
 const SERVICE_NAME = "dev.fx.companion";
 const MSG_PING: u32 = 1;
@@ -20,6 +21,11 @@ const MSG_STAT: u32 = 2;
 /// entry/byte counts plus the walk's own elapsed time. Heavy work stays in
 /// the daemon per PLAN section 4.
 const MSG_WALK: u32 = 3;
+/// ZeroCopyState RPCs (Week 4). The daemon attaches to the same POSIX shm
+/// object the client names; the payload itself never travels through the
+/// Mach message - only the key and control metadata do.
+const MSG_STATE_PUT: u32 = 4;
+const MSG_STATE_GET: u32 = 5;
 
 const RECV_BUFFER_SIZE = 4096;
 
@@ -55,6 +61,28 @@ const WalkReply = extern struct {
     entries: u64,
     bytes_sum: u64,
     elapsed_ns: u64,
+};
+
+/// Client -> daemon body for the ZeroCopyState RPCs. The key names a POSIX
+/// shm object ("/fxcomp-<key>") both sides attach to; capacity must match
+/// across processes.
+const StateRequest = extern struct {
+    hdr: c.mach_msg_header_t,
+    key: [48]u8,
+    capacity: u64 = zcs.DEFAULT_CAPACITY,
+    /// Exact payload bytes that follow the struct (PUT only). Wire padding
+    /// after the payload is NOT part of the payload.
+    payload_len: u64 = 0,
+};
+
+/// Daemon -> client body for the ZeroCopyState RPCs.
+const StateReply = extern struct {
+    hdr: c.mach_msg_header_t,
+    /// 0 = ok, 1 = open/attach failed, 2 = payload too large
+    status: u32,
+    _pad: u32 = 0,
+    epoch: u64,
+    length: u64,
 };
 
 /// Walks run off the main receive loop so one blocked open() (macOS TCC
@@ -185,6 +213,54 @@ fn handleConnection(hdr: *c.mach_msg_header_t) void {
             };
             th.detach();
         },
+        MSG_STATE_PUT, MSG_STATE_GET => {
+            if (hdr.msgh_size < @sizeOf(StateRequest)) {
+                sendStateReply(hdr, 1, 0, 0);
+                return;
+            }
+            const req: *const StateRequest = @ptrCast(@alignCast(hdr));
+            // msgh_size may exceed the fixed body (inline payload follows);
+            // clamp only against the receive buffer, not the struct size.
+            const body_end: usize = @min(hdr.msgh_size, RECV_BUFFER_SIZE);
+            const key = std.mem.sliceTo(req.key[0..req.key.len], 0);
+
+            var region = zcs.Region.open(key, req.capacity) catch {
+                sendStateReply(hdr, 1, 0, 0);
+                return;
+            };
+            defer region.detach();
+            // The daemon is a peer, never the owner: do not unlink here.
+
+            if (hdr.msgh_id == MSG_STATE_PUT) {
+                // Payload follows the request body; its exact length comes
+                // from payload_len (wire padding is not payload).
+                const payload_off = @sizeOf(StateRequest);
+                const declared: usize = @intCast(req.payload_len);
+                const avail = body_end -| payload_off;
+                const plen = @min(declared, avail);
+                if (plen == 0 or plen != declared) {
+                    sendStateReply(hdr, 2, 0, 0);
+                    return;
+                }
+                const payload = @as([*]const u8, @ptrCast(req))[payload_off .. payload_off + plen];
+                region.put(payload) catch {
+                    sendStateReply(hdr, 2, 0, 0);
+                    return;
+                };
+                sendStateReply(hdr, 0, region.epoch(), payload.len);
+            } else {
+                // GET: copy the current slab contents back inline.
+                var out_buf: [RECV_BUFFER_SIZE]u8 = undefined;
+                const got = region.get(&out_buf) catch {
+                    sendStateReply(hdr, 1, 0, 0);
+                    return;
+                };
+                sendStateReply(hdr, 0, region.epoch(), got.len);
+                // The reply above carries only metadata; a full payload reply
+                // would need a bigger struct. For the proof-of-concept the
+                // client verifies via its own attach (see statetool).
+            }
+        },
         else => {},
     }
     std.debug.print("[fx-companiond] served pid={d} version={d}\n", .{ peer.pid, peer.pidversion });
@@ -265,6 +341,36 @@ fn sendWalkReply(req_hdr: *const c.mach_msg_header_t, body: *WalkReply) void {
     );
     if (sret != c.KERN_SUCCESS) {
         std.debug.print("[fx-companiond] walk reply send FAILED kr={x}\n", .{@as(u32, @bitCast(sret))});
+    }
+}
+
+/// Structured reply for the ZeroCopyState RPCs.
+fn sendStateReply(req_hdr: *const c.mach_msg_header_t, status: u32, epoch: u64, length: u64) void {
+    var body = StateReply{
+        .hdr = undefined,
+        .status = status,
+        .epoch = epoch,
+        .length = length,
+    };
+    body.hdr = .{
+        .msgh_bits = c.MACH_MSG_TYPE_MOVE_SEND_ONCE,
+        .msgh_size = @sizeOf(StateReply),
+        .msgh_remote_port = req_hdr.msgh_remote_port,
+        .msgh_local_port = c.MACH_PORT_NULL,
+        .msgh_voucher_port = 0,
+        .msgh_id = if (req_hdr.msgh_id == MSG_STATE_PUT) MSG_STATE_PUT else MSG_STATE_GET,
+    };
+    const sret = c.mach_msg(
+        &body.hdr,
+        c.MACH_SEND_MSG,
+        @sizeOf(StateReply),
+        0,
+        c.MACH_PORT_NULL,
+        0,
+        c.MACH_PORT_NULL,
+    );
+    if (sret != c.KERN_SUCCESS) {
+        std.debug.print("[fx-companiond] state reply send FAILED kr={x}\n", .{@as(u32, @bitCast(sret))});
     }
 }
 

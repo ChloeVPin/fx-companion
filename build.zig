@@ -96,8 +96,30 @@ pub fn build(b: *std.Build) void {
     const install_gate = b.addInstallArtifact(gate, .{});
     b.getInstallStep().dependOn(&install_gate.step);
 
+    // statetool: ZeroCopyState proof-of-concept client.
+    const state_mod = b.createModule(.{
+        .root_source_file = b.path("src/statetool.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const statetool = b.addExecutable(.{
+        .name = "statetool",
+        .root_module = state_mod,
+    });
+    const install_state = b.addInstallArtifact(statetool, .{});
+    b.getInstallStep().dependOn(&install_state.step);
+
     const unit_tests = b.addTest(.{ .root_module = daemon_mod });
+    const zcs_mod = b.createModule(.{
+        .root_source_file = b.path("src/zcs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const zcs_tests = b.addTest(.{ .root_module = zcs_mod });
     const run_tests = b.addRunArtifact(unit_tests);
+    const run_zcs_tests = b.addRunArtifact(zcs_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_zcs_tests.step);
 }
