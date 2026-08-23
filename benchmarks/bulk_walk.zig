@@ -83,23 +83,43 @@ const PCond = struct {
 pub const WalkOut = shared.WalkOut;
 
 pub const WORKERS = 8;
+var workers_override: ?usize = null;
+
+/// Testing/benchmark hook: override the worker count for the next walk.
+pub fn setWorkers(n: usize) void {
+    workers_override = n;
+}
+
+fn activeWorkers() usize {
+    return workers_override orelse WORKERS;
+}
 const BUF_SIZE: usize = 128 * 1024; // healeycodes found this optimal
 
-fn makeAttrlist() c.attrlist {
+fn makeAttrlist(sum_sizes: bool) c.attrlist {
     // ATTR_CMN_ERROR is deliberately NOT requested: on current macOS it makes
     // getattrlistbulk reject mixed common+file requests with EINVAL in the
     // per-entry error slot, zeroing the file-group fields (datalen). The
     // returned-attrs bitmap is checked instead.
+    //
+    // Names mode (sum_sizes=false) also drops FILEID and DATALENGTH: every
+    // requested group costs bytes per entry inside the 128 KB buffer, and
+    // skipping them packs more entries per syscall. OBJTYPE must stay - it
+    // drives recursion.
     return .{
         .bitmapcount = c.ATTR_BIT_MAP_COUNT,
         .reserved = 0,
-        .commonattr = c.ATTR_CMN_RETURNED_ATTRS |
-            c.ATTR_CMN_NAME |
-            c.ATTR_CMN_OBJTYPE |
-            c.ATTR_CMN_FILEID,
+        .commonattr = if (sum_sizes)
+            c.ATTR_CMN_RETURNED_ATTRS |
+                c.ATTR_CMN_NAME |
+                c.ATTR_CMN_OBJTYPE |
+                c.ATTR_CMN_FILEID
+        else
+            c.ATTR_CMN_RETURNED_ATTRS |
+                c.ATTR_CMN_NAME |
+                c.ATTR_CMN_OBJTYPE,
         .volattr = 0,
         .dirattr = 0,
-        .fileattr = c.ATTR_FILE_DATALENGTH,
+        .fileattr = if (sum_sizes) c.ATTR_FILE_DATALENGTH else 0,
         .forkattr = 0,
     };
 }
@@ -114,6 +134,18 @@ fn rdU64(p: [*]const u8) u64 {
     return std.mem.readInt(u64, p[0..8], .little);
 }
 
+/// A queued directory: the PARENT's open dirfd plus the child name and the
+/// child's relative path. The consumer opens the child via openat at pop
+/// time, so queued jobs hold no fds of their own.
+const DirJob = struct {
+    // Queued form: parent fd + name (no fds held while queued).
+    parent_dfd: c_int = -1,
+    name: []u8 = "",
+    // Popped form handed to the worker: own fd + path.
+    dfd: c_int = -1,
+    prefix: []u8,
+};
+
 /// Shared state across workers. Each field is either written before threads
 /// start, or updated only through its own atomic.
 const WalkState = struct {
@@ -124,45 +156,71 @@ const WalkState = struct {
     bytes_sum: std.atomic.Value(u64),
     truncated: std.atomic.Value(u32), // bool as u32 for atomic RMW simplicity
 
-    /// Work queue: directories discovered but not yet claimed. Workers pop
-    /// from the tail under a mutex; producers push under the same lock.
+    /// Work queue: deferred directory opens. Jobs carry the PARENT dirfd plus
+    /// the child name; the fd is duped via openat at pop time. Queued jobs
+    /// therefore hold no fds of their own - the number of simultaneously
+    /// open fds is bounded by activeWorkers()+1 regardless of tree shape,
+    /// which keeps us safe under any RLIMIT_NOFILE (a queue of open fds
+    /// silently dropped subtrees under launchd's default limit).
     mu: PMutex = .{},
-    pending: std.ArrayListUnmanaged([]u8) = .empty,
+    pending: std.ArrayListUnmanaged(DirJob) = .empty,
     idle_workers: usize = 0,
     done: bool = false,
     cond: PCond = .{},
 
-    fn pushDir(self: *WalkState, path: []const u8) void {
-        const dup = std.heap.c_allocator.dupe(u8, path) catch {
+    /// Queue one child directory as (parent fd, name, path). Dups both
+    /// strings; holds no fd. Never blocks.
+    fn pushDir(self: *WalkState, parent_dfd: c_int, name: []const u8, prefix: []const u8) void {
+        const ndup = std.heap.c_allocator.dupe(u8, name) catch {
+            self.truncated.store(1, .monotonic);
+            return;
+        };
+        const pdup: []u8 = std.heap.c_allocator.dupe(u8, prefix) catch {
+            std.heap.c_allocator.free(ndup);
             self.truncated.store(1, .monotonic);
             return;
         };
         self.mu.lock();
         defer self.mu.unlock();
-        self.pending.append(std.heap.c_allocator, dup) catch {
-            std.heap.c_allocator.free(dup);
+        self.pending.append(std.heap.c_allocator, .{ .parent_dfd = parent_dfd, .name = ndup, .prefix = pdup }) catch {
+            std.heap.c_allocator.free(ndup);
+            std.heap.c_allocator.free(pdup);
             self.truncated.store(1, .monotonic);
         };
         self.cond.signal();
     }
 
-    /// Pop one queued directory. Returns null when the whole walk is done
-    /// (queue empty and no other worker can produce more).
-    fn takeDir(self: *WalkState) ?[]u8 {
+    /// Pop one queued directory and OPEN it via openat against the parent
+    /// fd. The returned job owns the fresh fd plus the path string. Returns
+    /// null when the whole walk is done.
+    fn takeDir(self: *WalkState) ?DirJob {
+        const active_workers = activeWorkers();
         self.mu.lock();
         defer self.mu.unlock();
         while (true) {
             if (self.pending.items.len > 0) {
-                return self.pending.pop().?;
+                const q = self.pending.pop().?;
+                const cdfd = c.openat(q.parent_dfd, @ptrCast(q.name.ptr), c.O_RDONLY | c.O_NONBLOCK, @as(c_uint, 0));
+                std.heap.c_allocator.free(q.name);
+                if (cdfd < 0) {
+                    // Child vanished or is unopenable; skip, keep draining.
+                    if (q.prefix.len > 0) std.heap.c_allocator.free(q.prefix);
+                    continue;
+                }
+                return .{ .parent_dfd = q.parent_dfd, .name = "", .dfd = cdfd, .prefix = q.prefix };
             }
             // Queue empty: wait until another worker pushes or all workers
             // are idle here simultaneously (= walk finished).
             self.idle_workers += 1;
-            if (self.idle_workers == WORKERS) {
+            if (self.idle_workers == active_workers) {
                 self.done = true;
                 self.cond.broadcast();
                 return null;
             }
+            // NOTE: WORKERS counts every thread that calls takeDir(),
+            // including the main thread's workerMain pass. Spawning
+            // WORKERS-1 threads + main = WORKERS participants, so the
+            // idle count reaching WORKERS really does mean quiescence.
             self.cond.wait(&self.mu);
             self.idle_workers -= 1;
             if (self.done) return null;
@@ -170,99 +228,98 @@ const WalkState = struct {
     }
 };
 
-/// One bulk pass over an open directory fd. Returns the subdirectory names
-/// found; counts go straight into the atomics.
-fn scanOneDir(st: *WalkState, dir_path: []const u8, subs: *std.ArrayListUnmanaged([]u8)) void {
-    const buffer = std.heap.c_allocator.alloc(u8, BUF_SIZE) catch {
-        st.truncated.store(1, .monotonic);
-        return;
-    };
-    defer std.heap.c_allocator.free(buffer);
+/// One bulk pass over an already-open directory fd. Consumes `dfd`.
+/// Child directories are NOT opened here: (parent fd, name) pairs are
+/// queued and the popper opens them, keeping in-flight fds bounded by the
+/// worker count instead of the queue depth.
+fn scanOneDirFd(st: *WalkState, dfd: c_int, prefix: []const u8, buffer: []u8) void {
+    defer _ = c.close(dfd);
+    scanOneDirNoClose(st, dfd, prefix, buffer);
+}
 
-    var pathbuf: [512]u8 = undefined;
-    if (dir_path.len >= pathbuf.len) {
-        st.truncated.store(1, .monotonic);
-        return;
+/// Same as scanOneDirFd but the caller keeps ownership of `dfd` (seed scan:
+/// queued jobs still need the root fd as their openat parent).
+fn scanOneDirNoClose(st: *WalkState, dfd: c_int, prefix: []const u8, buffer: []u8) void {
+
+    // Local accumulators: one atomic add per directory instead of one RMW
+    // per entry. With 409k entries over 8 threads the contended RMWs were
+    // a measurable slice of total time.
+    var local_entries: u64 = 0;
+    var local_bytes: u64 = 0;
+    defer {
+        if (local_entries > 0) _ = st.entries.fetchAdd(local_entries, .monotonic);
+        if (local_bytes > 0) _ = st.bytes_sum.fetchAdd(local_bytes, .monotonic);
     }
-    @memcpy(pathbuf[0..dir_path.len], dir_path);
-    pathbuf[dir_path.len] = 0;
 
-    cur_z: {
-        const dfd = c.open(@ptrCast(&pathbuf), c.O_RDONLY | c.O_NONBLOCK);
-        if (dfd < 0) break :cur_z;
-        defer _ = c.close(dfd);
+    while (true) {
+        const n = c.getattrlistbulk(dfd, @constCast(@ptrCast(&st.attrs)), buffer.ptr, buffer.len, 0);
+        if (n <= 0) break;
 
-        while (true) {
-            const n = c.getattrlistbulk(dfd, @constCast(@ptrCast(&st.attrs)), buffer.ptr, BUF_SIZE, 0);
-            if (n <= 0) break;
+        var p: usize = 0;
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(n))) : (i += 1) {
+            const rec = buffer.ptr + p;
+            const entry_len = rdU32(rec);
+            if (entry_len == 0 or p + entry_len > buffer.len) break;
 
-            var p: usize = 0;
-            var i: usize = 0;
-            while (i < @as(usize, @intCast(n))) : (i += 1) {
-                const rec = buffer.ptr + p;
-                const entry_len = rdU32(rec);
-                if (entry_len == 0 or p + entry_len > BUF_SIZE) break;
+            const ref_addr = p + 0x18;
+            const off = rdI32(rec + 0x18);
+            const ln = rdU32(rec + 0x1C);
+            const obj_type = rdU32(rec + 0x20);
+            const datalen = rdU64(rec + 0x2C);
 
-                const ref_addr = p + 0x18;
-                const off = rdI32(rec + 0x18);
-                const ln = rdU32(rec + 0x1C);
-                const obj_type = rdU32(rec + 0x20);
-                const datalen = rdU64(rec + 0x2C);
-
-                var name: []const u8 = "";
-                if (ln > 0) {
-                    const nb_i = @as(i64, @intCast(ref_addr)) + off;
-                    if (nb_i >= 0 and nb_i + ln <= BUF_SIZE) {
-                        const nb: usize = @intCast(nb_i);
-                        const span = @min(ln - 1, BUF_SIZE - nb);
-                        const nul = std.mem.indexOfScalar(u8, buffer[nb..][0..span], 0) orelse span;
-                        name = buffer[nb..][0..nul];
-                    }
+            var name2: []const u8 = "";
+            if (ln > 0) {
+                const nb_i = @as(i64, @intCast(ref_addr)) + off;
+                if (nb_i >= 0 and nb_i + ln <= buffer.len) {
+                    const nb: usize = @intCast(nb_i);
+                    const span = @min(ln - 1, buffer.len - nb);
+                    const nul = std.mem.indexOfScalar(u8, buffer[nb..][0..span], 0) orelse span;
+                    name2 = buffer[nb..][0..nul];
                 }
-
-                const is_dot = name.len == 1 and name[0] == '.';
-                const is_dotdot = name.len == 2 and name[0] == '.' and name[1] == '.';
-                if (name.len > 0 and !is_dot and !is_dotdot) {
-                    _ = st.entries.fetchAdd(1, .monotonic);
-                    if (obj_type == 1 and st.sum_sizes and datalen > 0) {
-                        _ = st.bytes_sum.fetchAdd(datalen, .monotonic);
-                    } else if (obj_type == 2) {
-                        if (dir_path.len + 1 + name.len < 512) {
-                            const child: ?[]u8 = std.fmt.allocPrint(
-                                std.heap.c_allocator,
-                                "{s}/{s}",
-                                .{ dir_path, name },
-                            ) catch null;
-                            if (child) |ch| {
-                                subs.append(std.heap.c_allocator, ch) catch {
-                                    std.heap.c_allocator.free(ch);
-                                    st.truncated.store(1, .monotonic);
-                                };
-                            } else {
-                                st.truncated.store(1, .monotonic);
-                            }
-                        } else {
-                            st.truncated.store(1, .monotonic);
-                        }
-                    }
-                }
-
-                p += entry_len;
             }
+
+            const is_dot = name2.len == 1 and name2[0] == '.';
+            const is_dotdot = name2.len == 2 and name2[0] == '.' and name2[1] == '.';
+            if (name2.len > 0 and !is_dot and !is_dotdot) {
+                local_entries += 1;
+                if (obj_type == 1 and st.sum_sizes and datalen > 0) {
+                    local_bytes += datalen;
+                } else if (obj_type == 2) {
+                    // DEFER the child's open: queue (parent fd, name). Only
+                    // workers popping jobs hold open fds, so total in-flight
+                    // fds = activeWorkers + seed, independent of tree width.
+                    // (Opening eagerly parked one fd per queued job and hit
+                    // RLIMIT_NOFILE at ~250 dirs on wide trees.)
+                    const child_prefix = if (prefix.len == 0)
+                        std.heap.c_allocator.dupe(u8, name2) catch null
+                    else
+                        std.fmt.allocPrint(std.heap.c_allocator, "{s}/{s}", .{ prefix, name2 }) catch null;
+                    if (child_prefix) |cp| {
+                        st.pushDir(dfd, name2, cp);
+                        std.heap.c_allocator.free(cp);
+                    } else {
+                        st.truncated.store(1, .monotonic);
+                    }
+                }
+            }
+
+            p += entry_len;
         }
     }
 }
 
-fn workerMain(st: *WalkState) void {
-    // Per-worker scratch so the hot loop never touches a shared allocator.
-    var subs: std.ArrayListUnmanaged([]u8) = .empty;
-    defer subs.deinit(std.heap.c_allocator);
 
-    while (st.takeDir()) |dir_path| {
-        scanOneDir(st, dir_path, &subs);
-        std.heap.c_allocator.free(dir_path);
-        for (subs.items) |ch| st.pushDir(ch);
-        subs.clearRetainingCapacity();
+
+fn workerMain(st: *WalkState) void {
+    // Reusable 128 KB bulk buffer for this worker's whole lifetime.
+    const buffer = std.heap.c_allocator.alloc(u8, BUF_SIZE) catch return;
+    defer std.heap.c_allocator.free(buffer);
+
+    while (st.takeDir()) |job| {
+        // scanOneDirFd closes job.dfd; we free the path string after.
+        scanOneDirFd(st, job.dfd, job.prefix, buffer);
+        if (job.prefix.len > 0) std.heap.c_allocator.free(job.prefix);
     }
 }
 
@@ -276,21 +333,27 @@ pub fn walkAttrs(root: []const u8) !WalkOut {
 
 pub fn walkCommon(root: []const u8, sum_sizes: bool) !WalkOut {
     if (root.len >= 512) return error.PathTooLong;
+    var root_buf: [512]u8 = undefined;
+    @memcpy(root_buf[0..root.len], root);
+    root_buf[root.len] = 0;
+    const root_z: [*:0]const u8 = @ptrCast(&root_buf);
 
     var st = WalkState{
-        .attrs = makeAttrlist(),
+        .attrs = makeAttrlist(sum_sizes),
         .sum_sizes = sum_sizes,
         .entries = std.atomic.Value(u64).init(0),
         .bytes_sum = std.atomic.Value(u64).init(0),
         .truncated = std.atomic.Value(u32).init(0),
     };
 
-    // Seed: walk the root on this thread first. Its subdirectories become
-    // the initial work items; workers fan out from there.
-    var seed_subs: std.ArrayListUnmanaged([]u8) = .empty;
-    defer seed_subs.deinit(std.heap.c_allocator);
-    scanOneDir(&st, root, &seed_subs);
-    for (seed_subs.items) |ch| st.pushDir(ch);
+    // Seed: open the root and scan it on this thread. The root fd must stay
+    // OPEN until the whole walk drains: queued jobs reference it as their
+    // parent for openat. Closed after all workers join, below.
+    const root_fd = c.open(@ptrCast(root_z), c.O_RDONLY | c.O_NONBLOCK);
+    if (root_fd < 0) return error.FtsOpenFailed;
+    const seed_buffer = std.heap.c_allocator.alloc(u8, BUF_SIZE) catch return error.FtsOpenFailed;
+    defer std.heap.c_allocator.free(seed_buffer);
+    scanOneDirNoClose(&st, root_fd, "", seed_buffer);
 
     // If the root itself had no subdirectories we are already done.
     if (st.pending.items.len == 0) {
@@ -298,9 +361,10 @@ pub fn walkCommon(root: []const u8, sum_sizes: bool) !WalkOut {
     }
 
     var threads: [WORKERS - 1]std.Thread = undefined;
+    const n_extra = activeWorkers() - 1;
     var started: usize = 0;
     errdefer for (threads[0..started]) |t| t.join();
-    for (&threads) |*t| {
+    for (threads[0..n_extra]) |*t| {
         t.* = try std.Thread.spawn(.{}, workerMain, .{&st});
         started += 1;
     }
@@ -308,10 +372,14 @@ pub fn walkCommon(root: []const u8, sum_sizes: bool) !WalkOut {
     // Main thread works too instead of just waiting.
     workerMain(&st);
 
-    for (&threads) |t| t.join();
+    for (threads[0..n_extra]) |t| t.join();
+    _ = c.close(root_fd); // queued jobs all popped; no openat parents left
     st.mu.lock();
     defer st.mu.unlock();
-    for (st.pending.items) |item| std.heap.c_allocator.free(item);
+    for (st.pending.items) |item| {
+        std.heap.c_allocator.free(item.name);
+        if (item.prefix.len > 0) std.heap.c_allocator.free(item.prefix);
+    }
     st.pending.deinit(std.heap.c_allocator);
 
     return .{

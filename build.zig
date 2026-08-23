@@ -110,6 +110,21 @@ pub fn build(b: *std.Build) void {
     const install_state = b.addInstallArtifact(statetool, .{});
     b.getInstallStep().dependOn(&install_state.step);
 
+    // wprobe: worker-count sweep for the bulk walker.
+    const wprobe_mod = b.createModule(.{
+        .root_source_file = b.path("benchmarks/wprobe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wprobe_mod.addImport("bulk_walk", walklib_mod);
+    const wprobe = b.addExecutable(.{
+        .name = "wprobe",
+        .root_module = wprobe_mod,
+    });
+    const install_wprobe = b.addInstallArtifact(wprobe, .{});
+    b.getInstallStep().dependOn(&install_wprobe.step);
+
     const unit_tests = b.addTest(.{ .root_module = daemon_mod });
     const zcs_mod = b.createModule(.{
         .root_source_file = b.path("src/zcs.zig"),
