@@ -13,9 +13,12 @@ Weeks 1-2 skeleton:
 
 - `fx-companiond`: Zig Mach-service daemon with per-message audit-token
   validation (kernel-stamped `MACH_RCV_TRAILER_AUDIT` trailer; euid policy;
-  pid/pidversion logged), ping and stat RPCs.
+  pid/pidversion logged), ping and stat RPCs. The stat reply includes
+  `init_us`, the daemon's self-timed entry-to-check-in window.
 - `com.chloevpin.fx-companiond.plist`: on-demand LaunchAgent registration.
-  Edit the absolute path inside before installing elsewhere.
+  Edit the absolute path inside before installing elsewhere. Verified:
+  launchd owns `dev.fx.companion`, spawns the daemon at first Mach lookup,
+  and nothing runs until then.
 - `latency`: client measuring round-trip latency against the running daemon.
 - `benchmarks/traversal_bench`: fts vs readdir vs getattrlistbulk shootout
   over a synthetic tree (name-only and attribute-heavy modes).
@@ -65,6 +68,14 @@ Machine: Apple silicon Mac, macOS 27.0, ReleaseFast build, warm cache.
 
 IPC round trip through the audited Mach path (n=101):
 p50 13-19 us, p99 25-76 us; bootstrap lookup 130-350 us.
+
+Launchd on-demand activation (verified end to end): the agent registers
+`dev.fx.companion` with no process running; the first Mach lookup spawns the
+daemon. Daemon self-timed init (entry to bootstrap_check_in complete):
+412 us, well inside the <5 ms cold-start budget. Daemon RSS at idle:
+1.8 MB, inside the <15 MB budget. End-to-end cold first round trip,
+which additionally includes launchd fork/exec and dyld: 19-115 ms across
+runs; that span is launchd's spawn chain, not daemon initialization.
 
 Traversal, synthetic tree of 128 dirs x 256 files (32,896 entries,
 93.8 MB data), median of 5 runs:

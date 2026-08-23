@@ -5,6 +5,7 @@ const c = @import("machc.zig");
 
 const SERVICE_NAME = "dev.fx.companion";
 const MSG_PING: u32 = 1;
+const MSG_STAT: u32 = 2;
 const SAMPLES = 101;
 
 const Request = extern struct {
@@ -18,7 +19,9 @@ const Reply = extern struct {
     trailer_pad: [128]u8 = [_]u8{0} ** 128,
 };
 
-fn pingOnce(port: c.mach_port_t) !u64 {
+/// One synchronous request/reply. Returns elapsed ns; fills payload with the
+/// daemon's reply text (NUL-padded) when non-null.
+fn roundTrip(port: c.mach_port_t, msg_id: u32, payload_out: ?*[96]u8) !u64 {
     var reply_port: c.mach_port_t = c.MACH_PORT_NULL;
     // Allocate a receive right; the send side grants it back as send-once.
     const alloc_kr = machPortAllocate(&reply_port);
@@ -32,7 +35,7 @@ fn pingOnce(port: c.mach_port_t) !u64 {
         .msgh_remote_port = port,
         .msgh_local_port = reply_port,
         .msgh_voucher_port = 0,
-        .msgh_id = @bitCast(MSG_PING),
+        .msgh_id = @bitCast(msg_id),
     };
 
     const t0 = c.nowNs();
@@ -63,8 +66,19 @@ fn pingOnce(port: c.mach_port_t) !u64 {
         return error.ReceiveFailed;
     }
     // msgh_size covers body only; trailer is appended beyond it.
-    if (reply.hdr.msgh_id != @as(c_int, @intCast(MSG_PING))) return error.BadReply;
-    if (!std.mem.eql(u8, reply.payload[0..4], "pong")) return error.BadReply;
+    if (reply.hdr.msgh_id != @as(c_int, @intCast(msg_id))) return error.BadReply;
+    if (payload_out) |out| {
+        @memset(out, 0);
+        const n = @min(out.len, reply.payload.len);
+        @memcpy(out[0..n], reply.payload[0..n]);
+    }
+    return elapsed;
+}
+
+fn pingOnce(port: c.mach_port_t) !u64 {
+    var payload: [96]u8 = undefined;
+    const elapsed = try roundTrip(port, MSG_PING, &payload);
+    if (!std.mem.eql(u8, payload[0..4], "pong")) return error.BadReply;
     return elapsed;
 }
 
@@ -101,5 +115,13 @@ pub fn main() !void {
     std.debug.print("round trip p50   : {d:>8.1} us\n", .{@as(f64, @floatFromInt(p50)) / 1000.0});
     std.debug.print("round trip p99   : {d:>8.1} us   (n={d})\n", .{
         @as(f64, @floatFromInt(p99)) / 1000.0, SAMPLES,
+    });
+
+    // Daemon self-reported init time closes the <5 ms cold-start budget.
+    var payload: [96]u8 = undefined;
+    const stat_ns = try roundTrip(port, MSG_STAT, &payload);
+    std.debug.print("daemon stat      : {s}   ({d:.1} us)\n", .{
+        std.mem.sliceTo(&payload, 0),
+        @as(f64, @floatFromInt(stat_ns)) / 1000.0,
     });
 }

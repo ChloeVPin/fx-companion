@@ -20,6 +20,9 @@ const RECV_BUFFER_SIZE = 4096;
 
 var start_ns: u64 = 0;
 var requests: u64 = 0;
+/// Self-timed main-entry -> bootstrap_check_in complete, in microseconds.
+/// Exposed via MSG_STAT so the cold-start budget is measurable end to end.
+var init_us: u64 = 0;
 
 const Reply = extern struct {
     hdr: c.mach_msg_header_t,
@@ -90,9 +93,10 @@ fn handleConnection(hdr: *c.mach_msg_header_t) void {
         MSG_PING => sendReply(hdr.msgh_remote_port, MSG_PING, "pong"),
         MSG_STAT => {
             var buf: [96]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{{\"uptime_s\":{d},\"requests\":{d}}}", .{
+            const s = std.fmt.bufPrint(&buf, "{{\"uptime_s\":{d},\"requests\":{d},\"init_us\":{d}}}", .{
                 (c.nowNs() - start_ns) / 1_000_000_000,
                 requests,
+                init_us,
             }) catch "{\"error\":\"fmt\"}";
             sendReply(hdr.msgh_remote_port, MSG_STAT, s);
         },
@@ -102,7 +106,8 @@ fn handleConnection(hdr: *c.mach_msg_header_t) void {
 }
 
 pub fn main() !void {
-    start_ns = c.nowNs();
+    const t_entry = c.nowNs();
+    start_ns = t_entry;
 
     var server_port: c.mach_port_t = c.MACH_PORT_NULL;
 
@@ -111,9 +116,10 @@ pub fn main() !void {
         std.debug.print("[fx-companiond] bootstrap_check_in failed kr={x}\n", .{@as(u32, @bitCast(kr))});
         return error.BootstrapFailed;
     }
+    init_us = (c.nowNs() - t_entry) / 1000;
 
-    std.debug.print("[fx-companiond] serving '{s}' pid={d} euid={d}\n", .{
-        SERVICE_NAME, c.getpid(), c.geteuid(),
+    std.debug.print("[fx-companiond] serving '{s}' pid={d} euid={d} init={d}us\n", .{
+        SERVICE_NAME, c.getpid(), c.geteuid(), init_us,
     });
 
     var buffer: [RECV_BUFFER_SIZE]u8 align(8) = undefined;
