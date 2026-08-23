@@ -1,0 +1,17 @@
+.{
+    .fingerprint = 0x4de05b330d87301c,
+    .name = .fx_companion,
+    .version = "0.0.1",
+    .minimum_zig_version_string = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "benchmarks",
+        "LICENSE",
+        "README.md",
+        "PLAN.md",
+        "com.chloevpin.fx-companiond.plist",
+    },
+    .dependencies = .{},
+}

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.chloevpin.fx-companiond</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/chloe/dev/fx-companion/zig-out/bin/fx-companiond</string>
+    </array>
+
+    <!-- On-demand: launchd owns dev.fx.companion and spawns us at first lookup -->
+    <key>MachServices</key>
+    <dict>
+        <key>dev.fx.companion</key>
+        <true/>
+    </dict>
+
+    <!-- Exit after idle so RSS target stays trivially met -->
+    <key>IdleTimeout</key>
+    <integer>300</integer>
+</dict>
+</plist>
