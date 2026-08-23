@@ -298,8 +298,12 @@ fn walkWorker(job: WalkJob) void {
     const t0 = c.nowNs();
     // flags bit0 = attrs (sum sizes); bit1 = names-only (no attribute decode).
     const names_only = (job.flags & 2) != 0;
+    // Names mode runs on the getdirentries pool: fx's own directory-read
+    // syscall with big per-worker buffers. Measured 2x faster than fx's
+    // single-threaded iterator on the 409k anchor; bulk records only win
+    // when attributes ride along (attrs mode stays on getattrlistbulk).
     const out = if (names_only)
-        walklib.walkNames(job.root[0..job.root_len]) catch |e| {
+        walklib.walkNamesGde(job.root[0..job.root_len]) catch |e| {
             sendWalkErr(job, e, t0);
             return;
         }

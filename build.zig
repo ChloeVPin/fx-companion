@@ -125,6 +125,21 @@ pub fn build(b: *std.Build) void {
     const install_wprobe = b.addInstallArtifact(wprobe, .{});
     b.getInstallStep().dependOn(&install_wprobe.step);
 
+    // gde_soak: correctness soak for the getdirentries walker backend.
+    const soak_mod = b.createModule(.{
+        .root_source_file = b.path("benchmarks/gde_soak.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    soak_mod.addImport("bulk_walk", walklib_mod);
+    const soak = b.addExecutable(.{
+        .name = "gde_soak",
+        .root_module = soak_mod,
+    });
+    const install_soak = b.addInstallArtifact(soak, .{});
+    b.getInstallStep().dependOn(&install_soak.step);
+
     const unit_tests = b.addTest(.{ .root_module = daemon_mod });
     const zcs_mod = b.createModule(.{
         .root_source_file = b.path("src/zcs.zig"),

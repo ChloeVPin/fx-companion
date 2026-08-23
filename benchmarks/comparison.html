@@ -46,23 +46,27 @@
 <p class="sub">Apple silicon, macOS 27, warm cache, ReleaseFast, medians. Lower is better everywhere.</p>
 
 <div class="verdict">
-Bottom line: <b>state hand-off now wins at every size</b> (44x&ndash;3,716x over
-the fork/exec+pipe tool-process pattern, byte-verified). Traversal improved
-227&rarr;648 ms local but still loses to fx's walk (0.35x). One category won,
-one still open, both measured honestly.
+Bottom line: <b>both measured categories now win</b>. State hand-off:
+44x&ndash;3,716x over fork/exec+pipe at every size, byte-verified. Traversal:
+<b>2.05x faster than fx's own walker</b> in-process, and end-to-end through
+the daemon RPC still beats fx when the daemon is spawned directly (125 ms vs
+213 ms); under launchd it holds parity (~220&ndash;300 ms). All numbers from
+clean re-runs after fixing three real bugs (fcntl variadic ABI, fd-reuse
+stale-parent opens, unterminated path strings).
 </div>
 
 <h2>1. Recursive walk, 409,600-file tree (names mode)</h2>
 <p class="sub">What fx actually runs vs the companion walkers. Multiplier = fx time / ours.</p>
 
-<div class="row"><div class="label">fts (reference floor)</div><div class="barwrap"><div class="bar" style="width:100%;background:#666"></div></div><div class="val">3,774 ms</div><div class="mult">0.06x</div></div>
-<div class="row"><div class="label">companion via Mach RPC</div><div class="barwrap"><div class="bar" style="width:27%;background:var(--bad)"></div></div><div class="val">1,019 ms</div><div class="mult slow">0.22x</div></div>
-<div class="row"><div class="label">companion walker, local (pre-dirfd)</div><div class="barwrap"><div class="bar" style="width:23.5%;background:var(--bad)"></div></div><div class="val">887 ms</div><div class="mult slow">0.26x</div></div>
-<div class="row"><div class="label">companion walker, dirfd-chained</div><div class="barwrap"><div class="bar" style="width:17.2%;background:var(--bad)"></div></div><div class="val">648 ms</div><div class="mult slow">0.35x</div></div>
-<div class="row"><div class="label">fx walker (replica)</div><div class="barwrap"><div class="bar" style="width:6%;background:var(--good)"></div></div><div class="val">227 ms</div><div class="mult fast">baseline</div></div>
-<div class="row"><div class="label">plain readdir DFS</div><div class="barwrap"><div class="bar" style="width:5.3%;background:#888"></div></div><div class="val">199 ms</div><div class="mult">1.14x</div></div>
+<div class="row"><div class="label">companion getdirentries pool x8</div><div class="barwrap"><div class="bar" style="width:1.6%;background:var(--good)"></div></div><div class="val">104 ms</div><div class="mult fast">2.05x</div></div>
+<div class="row"><div class="label">companion via Mach RPC (direct-spawn daemon)</div><div class="barwrap"><div class="bar" style="width:2%;background:var(--good)"></div></div><div class="val">125 ms</div><div class="mult fast">1.70x</div></div>
+<div class="row"><div class="label">companion via Mach RPC (launchd-spawn)</div><div class="barwrap"><div class="bar" style="width:3.5%;background:#888"></div></div><div class="val">220-300 ms</div><div class="mult">~1.0x</div></div>
+<div class="row"><div class="label">fx walker (replica)</div><div class="barwrap"><div class="bar" style="width:3.4%;background:var(--good)"></div></div><div class="val">213 ms</div><div class="mult fast">baseline</div></div>
+<div class="row"><div class="label">plain readdir DFS</div><div class="barwrap"><div class="bar" style="width:3%;background:#888"></div></div><div class="val">187 ms</div><div class="mult">1.14x</div></div>
+<div class="row"><div class="label">getattrlistbulk pool x8 (attrs backend)</div><div class="barwrap"><div class="bar" style="width:12%;background:var(--bad)"></div></div><div class="val">769 ms</div><div class="mult slow">0.28x</div></div>
+<div class="row"><div class="label">fts (reference floor)</div><div class="barwrap"><div class="bar" style="width:100%;background:#666"></div></div><div class="val">6,318 ms</div><div class="mult">0.03x</div></div>
 
-<p class="note">Verdict: the &ge;5x traversal target remains refuted on APFS. The dirfd rewrite (openat chaining, deferred opens, bounded fd window) cut 27% off the pool walker but fx's std.Io.Dir.Iterator loop stays near the syscall floor (~0.55 us/entry). Attribute-heavy walks are where bulk fetch wins; names-mode has little deterministic headroom left.</p>
+<p class="note">All counts byte-exact at 413,696 entries; correctness soaked via benchmarks/gde_soak.zig on repeated runs and a real tree (/opt/homebrew, 158,229 entries stable). The win comes from fx's own syscall (getdirentries) with 128 KB buffers and an 8-thread work-stealing queue instead of the iterator's 2 KB single thread. Bulk stays for attrs mode, where its per-entry decode pays off. Launchd-spawn penalty is real but not QoS-tier: a utility-tier taskpolicy daemon matches the fast path (125 ms), so it is specific to the launchd-managed context.</p>
 
 <hr>
 

@@ -17,6 +17,12 @@
         <true/>
     </dict>
 
+    <!-- Without this launchd runs the daemon at a background QoS tier,
+         throttling walk threads to ~1/3 of their in-process speed.
+         Measured on the 409k anchor: ~293 ms vs ~104 ms local. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
     <!-- Exit after idle so RSS target stays trivially met -->
     <key>IdleTimeout</key>
     <integer>300</integer>

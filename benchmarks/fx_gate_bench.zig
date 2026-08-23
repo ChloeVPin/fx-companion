@@ -73,6 +73,11 @@ fn bulkNames(ctx: *anyopaque) anyerror!u64 {
     const out = try bulk.walkNames(self.root);
     return out.entries;
 }
+fn bulkGdeNames(ctx: *anyopaque) anyerror!u64 {
+    const self: *BulkCtx = @ptrCast(@alignCast(ctx));
+    const out = try bulk.walkNamesGde(self.root);
+    return out.entries;
+}
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa_state = std.heap.DebugAllocator(.{}){};
@@ -128,4 +133,5 @@ pub fn main(init: std.process.Init.Minimal) !void {
     runNamed("readdir names", runs, &times2, &entries, @ptrCast(&rd_ctx), readdirNames);
     var bulk_ctx = BulkCtx{ .root = root };
     runNamed("bulk(8w) names", runs, &times2, &entries, @ptrCast(&bulk_ctx), bulkNames);
+    runNamed("gde-pool(8w) names", runs, &times2, &entries, @ptrCast(&bulk_ctx), bulkGdeNames);
 }
