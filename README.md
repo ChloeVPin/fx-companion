@@ -25,11 +25,13 @@ Weeks 1-2 skeleton:
 - `benchmarks/traversal_bench`: fts vs readdir vs getattrlistbulk shootout
   over a synthetic tree (name-only and attribute-heavy modes).
 
-Walk RPC notes: walks execute on a worker thread, so a blocked `open()`
-(macOS TCC consent on Downloads/Documents/Desktop can stall indefinitely for
-launchd-spawned processes) never wedges the service; concurrent requests get
-an immediate busy status. The walker's fixed 8192-directory table reports a
-truncated status instead of silently dropping directories.
+Walk RPC notes: walks execute on a worker pool (8 threads, pthread
+mutex/condvar - Zig 0.16 removed std.Thread sync primitives), so a blocked
+`open()` (macOS TCC consent on Downloads/Documents/Desktop can stall
+indefinitely for launchd-spawned processes) never wedges the service;
+concurrent requests get an immediate busy status. There is no fixed
+directory cap; the walk covers the whole tree and reports a truncated flag
+only if an allocation fails.
 
 ## Build
 
@@ -94,10 +96,14 @@ Traversal, synthetic tree of 128 dirs x 256 files (32,896 entries,
 | readdir+lstat   | 13.0 ms  | 68.8 ms  |
 | getattrlistbulk | 26.0 ms  | 26.1 ms  |
 
-Walk RPC over the daemon (repo tree, 408 entries / 321 MB): 12.7 ms walk,
-12.8 ms round trip - the Mach hop adds under 1% on real workloads.
-`/opt/homebrew` (15k dirs) completes in 3.1 s with a truncated status;
-counts are lower bounds past the walker's directory-table cap.
+Walk RPC over the daemon (repo tree, 461 entries / 350 MB): 14.6 ms walk,
+15.0 ms round trip - the Mach hop adds under 1% on real workloads.
+The walker is a work-stealing worker pool (8 threads, pthread sync): each
+worker claims queued directories and walks its own subtree. On /opt/homebrew
+(15k dirs, 158k entries, 4.3 GB) it completes in ~830-940 ms with full
+counts - the previous single-threaded version took 3.1 s and silently
+truncated past an 8192-directory cap. Daemon RSS under this load: 26 MB
+(the pool's per-worker buffers; idle RSS stays at 1.8 MB).
 
 Early signals consistent with tempel.org's finding that no single syscall
 wins everywhere: readdir is fastest name-only here, while bulk wins once

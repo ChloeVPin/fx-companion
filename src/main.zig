@@ -206,7 +206,7 @@ fn walkWorker(job: WalkJob) void {
             .hdr = undefined,
             .status = switch (e) {
                 error.PathTooLong => 1,
-                error.Oom => 2,
+                else => 2,
             },
             .entries = 0,
             .bytes_sum = 0,
