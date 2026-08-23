@@ -131,5 +131,5 @@ maintenance risk. For the eval/gym workload prefer per-user isolation or VM snap
 
 1. Repository created (done).
 2. Weeks 1-2 XPC skeleton: LaunchAgent plist, daemon, audit-token validation, latency client (done).
-3. Week 3 benchmark harness instrumenting real fx walk/search paths plus the traversal shootout (harness scaffolded; fx instrumentation pending).
+3. Week 3 benchmark harness instrumenting real fx walk/search paths plus the traversal shootout (done: fx pinned at 04e0ae0, `walkWorkspacePaths` replicated syscall-for-syscall in `benchmarks/fx_replica_walk.zig`, gated in `benchmarks/fx_gate_bench.zig`; verdict in README: >=5x name-only traversal target refuted on APFS - fx's readdir iterator is already near the floor; bulk wins only attribute-heavy scans).
 4. First measured numbers on modern Apple silicon.

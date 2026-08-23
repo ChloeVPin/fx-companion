@@ -38,6 +38,9 @@ const Reply = extern struct {
 /// 512 bytes matches the walkers' internal path buffers.
 const WalkRequest = extern struct {
     hdr: c.mach_msg_header_t,
+    /// bit0: sum file sizes (attrs). bit1: count names only, no attribute
+    /// extraction beyond the dirent-equivalent bulk fetch.
+    flags: u32 = 0,
     root: [512]u8,
 };
 
@@ -160,6 +163,7 @@ fn handleConnection(hdr: *c.mach_msg_header_t) void {
             const ncpy = @min(root.len, job.root.len - 1);
             @memcpy(job.root[0..ncpy], root[0..ncpy]);
             job.root_len = ncpy;
+            job.flags = req.flags;
             @memcpy(job.reply_to[0..@sizeOf(c.mach_msg_header_t)], std.mem.asBytes(hdr)[0..@sizeOf(c.mach_msg_header_t)]);
 
             // Claim the single walk slot; a concurrent request is told busy
@@ -192,29 +196,42 @@ const WalkJob = struct {
     root: [512]u8 = undefined,
     root_len: usize = 0,
     reply_to: [@sizeOf(c.mach_msg_header_t)]u8 align(8) = undefined,
+    flags: u32 = 0,
 
     fn hdr(self: *const WalkJob) *const c.mach_msg_header_t {
         return @ptrCast(@alignCast(&self.reply_to));
     }
 };
 
+fn sendWalkErr(job: WalkJob, e: anyerror, t0: u64) void {
+    var bad = WalkReply{
+        .hdr = undefined,
+        .status = switch (e) {
+            error.PathTooLong => 1,
+            else => 2,
+        },
+        .entries = 0,
+        .bytes_sum = 0,
+        .elapsed_ns = c.nowNs() - t0,
+    };
+    sendWalkReply(job.hdr(), &bad);
+}
+
 fn walkWorker(job: WalkJob) void {
     defer @atomicStore(u8, &walk_busy, 0, .release);
     const t0 = c.nowNs();
-    const out = walklib.walkAttrs(job.root[0..job.root_len]) catch |e| {
-        var bad = WalkReply{
-            .hdr = undefined,
-            .status = switch (e) {
-                error.PathTooLong => 1,
-                else => 2,
-            },
-            .entries = 0,
-            .bytes_sum = 0,
-            .elapsed_ns = c.nowNs() - t0,
+    // flags bit0 = attrs (sum sizes); bit1 = names-only (no attribute decode).
+    const names_only = (job.flags & 2) != 0;
+    const out = if (names_only)
+        walklib.walkNames(job.root[0..job.root_len]) catch |e| {
+            sendWalkErr(job, e, t0);
+            return;
+        }
+    else
+        walklib.walkAttrs(job.root[0..job.root_len]) catch |e| {
+            sendWalkErr(job, e, t0);
+            return;
         };
-        sendWalkReply(job.hdr(), &bad);
-        return;
-    };
     var ok = WalkReply{
         .hdr = undefined,
         .status = if (out.truncated) 4 else 0,

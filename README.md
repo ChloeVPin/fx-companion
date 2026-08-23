@@ -112,6 +112,55 @@ attributes ride along and stays flat regardless of mode. Concurrency
 These are single-machine observations, not claims; the >=4x target gate
 still requires instrumenting fx's own walk paths at the pinned commit.
 
+## Week 3 gate: fx-replica vs fx-companion (measured)
+
+fx pinned at 04e0ae0. Its recursive-walk fallback is `walkWorkspacePaths`
+in `src/core/workspace/workspace_files.zig`: single-threaded DFS with
+`std.Io.Dir.Iterator` (2048-byte readdir buffer), skipping `.git` and other
+ignored names plus hidden dirs. `benchmarks/fx_replica_walk.zig` reproduces
+that walker syscall-for-syscall (same iterator, same stack discipline, same
+ignored list). In git repos fx prefers `git ls-files` and only falls back to
+this walker; the POSIX path also backs grep/completion/file-index flows on
+non-git trees.
+
+Anchor workload: /tmp/fxanchor - 4,096 dirs, 409,600 files (the plan's
+>=400k-file anchor), APFS, warm cache, ReleaseFast, medians of 3 runs,
+names mode (count entries only) unless stated:
+
+| walker                          | median   |
+|---------------------------------|----------|
+| fx-replica collect (fx's real behavior: build path strings) | 227 ms |
+| fx-replica count                | 219 ms   |
+| plain readdir DFS (single-threaded) | 199 ms |
+| fts (single-threaded)           | 3,774 ms |
+| getattrlistbulk worker pool x8 (companion walker) | 887 ms |
+| companion daemon RPC (walk time) | 1,019-1,067 ms |
+
+Honest verdict for this tree and workload: the companion's bulk+pool walker
+is ~4x faster than fx's fallback **only against fts-shaped baselines**; it
+is ~4x SLOWER than fx's actual readdir-iterator fallback in names mode
+(227 ms fx-replica vs ~890 ms bulk pool vs ~1,020 ms over RPC). The Mach hop
+itself adds under 15% (RPC minus local bulk). The >=5x Week 3 traversal
+target is NOT met and should be treated as refuted for name-only walks on
+this machine: Zig's std.Io.Dir.Iterator readdir loop is already near the
+APFS floor (~0.5 us/entry), so there is little deterministic headroom left
+in names-mode traversal itself.
+
+Where a deterministic win remains plausible: attribute-heavy walks
+(lstat-per-file workloads like du/grep-size paths) where the plan's
+getattrlistbulk advantage is 3x+ even single-threaded (68.8 ms vs 26.1 ms
+on the synthetic tree above); and IPC/state work (Weeks 4-5), which this
+gate does not measure.
+
+Reproduce:
+
+```sh
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/fx_gate_bench /path/to/large/tree 3
+./zig-out/bin/fx-companiond &        # then:
+./zig-out/bin/walkrpc --names /path/to/large/tree
+```
+
 ## License
 
 Apache-2.0.

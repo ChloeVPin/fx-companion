@@ -14,6 +14,8 @@ const MSG_WALK: u32 = 3;
 
 const Request = extern struct {
     hdr: c.mach_msg_header_t,
+    /// bit0: sum sizes (attrs); bit1: names-only.
+    flags: u32 = 0,
     root: [512]u8,
 };
 
@@ -29,20 +31,28 @@ const Reply = extern struct {
 };
 
 fn printUsage() void {
-    std.debug.print("usage: walkrpc <root-path>\n", .{});
+    std.debug.print("usage: walkrpc [--names] <root-path>\n", .{});
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next(); // argv[0]
-    const root_arg = args.next() orelse {
+    var names_only = false;
+    var root_arg: ?[]const u8 = null;
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "--names")) {
+            names_only = true;
+        } else if (root_arg == null) {
+            root_arg = a;
+        } else {
+            printUsage();
+            return error.TooManyArgs;
+        }
+    }
+    const root = root_arg orelse {
         printUsage();
         return error.MissingRoot;
     };
-    if (args.next() != null) {
-        printUsage();
-        return error.TooManyArgs;
-    }
 
     var port: c.mach_port_t = c.MACH_PORT_NULL;
     const looked = c.bootstrap_look_up(c.bootstrap_port, SERVICE_NAME, &port);
@@ -53,10 +63,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var req = Request{
         .hdr = undefined,
+        .flags = if (names_only) 2 else 0,
         .root = [_]u8{0} ** 512,
     };
-    if (root_arg.len >= req.root.len) return error.PathTooLong;
-    @memcpy(req.root[0..root_arg.len], root_arg);
+    if (root.len >= req.root.len) return error.PathTooLong;
+    @memcpy(req.root[0..root.len], root);
     req.hdr = .{
         .msgh_bits = c.MACH_MSG_TYPE_COPY_SEND | (@as(u32, c.MACH_MSG_TYPE_MAKE_SEND_ONCE) << 8),
         .msgh_size = @sizeOf(Request),
@@ -110,8 +121,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("daemon walk time : {d:.1} ms\n", .{@as(f64, @floatFromInt(reply.elapsed_ns)) / 1e6});
             std.debug.print("rpc round trip   : {d:.1} ms\n", .{@as(f64, @floatFromInt(roundtrip_ns)) / 1e6});
 
-            // Cross-check against the same walker run locally.
-            const local = try walklib.walkAttrs(root_arg);
+            // Cross-check against the same walker run locally, same mode.
+            const local = if (names_only)
+                try walklib.walkNames(root)
+            else
+                try walklib.walkAttrs(root);
             std.debug.print("local walker     : {d} entries, {d} bytes ({s})\n", .{
                 local.entries, local.bytes_sum,
                 if (local.entries == reply.entries and local.bytes_sum == reply.bytes_sum) "MATCH" else "MISMATCH",

@@ -78,6 +78,24 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run the traversal shootout");
     bench_step.dependOn(&run_bench.step);
 
+    // fx gate bench: fx-replica walk vs daemon walk on the same tree.
+    const gate_mod = b.createModule(.{
+        .root_source_file = b.path("benchmarks/fx_gate_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gate_mod.addCSourceFile(.{
+        .file = b.path("benchmarks/fts_walk.c"),
+        .flags = &.{ "-O2", "-Wall" },
+    });
+    const gate = b.addExecutable(.{
+        .name = "fx_gate_bench",
+        .root_module = gate_mod,
+    });
+    const install_gate = b.addInstallArtifact(gate, .{});
+    b.getInstallStep().dependOn(&install_gate.step);
+
     const unit_tests = b.addTest(.{ .root_module = daemon_mod });
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
