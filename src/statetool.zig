@@ -19,6 +19,13 @@ const zcs = @import("zcs.zig");
 const pollc = @cImport({
     @cInclude("poll.h");
 });
+// fcntl(2) is variadic; a hand-written fixed-arity extern decl compiles but
+// silently fails to apply F_SETFL flags on this toolchain (arm64 macOS,
+// Zig 0.16): it returns 0 while O_NONBLOCK never takes effect. Route every
+// fcntl call through the true C prototype instead.
+const fcntlc = @cImport({
+    @cInclude("fcntl.h");
+});
 
 const SERVICE_NAME = "dev.fx.companion";
 const MSG_STATE_PUT: u32 = 4;
@@ -63,7 +70,7 @@ extern "c" fn pipe(fds: *[2]c_int) c_int;
 extern "c" fn fork() c_int;
 extern "c" fn dup2(oldfd: c_int, newfd: c_int) c_int;
 extern "c" fn close(fd: c_int) c_int;
-extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) c_int;
+// NOTE: do not hand-declare fcntl here; use fcntlc.fcntl (variadic proto).
 extern "c" fn __error() *c_int; // per-thread errno on Darwin
 extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
@@ -71,15 +78,15 @@ extern "c" fn execv(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_i
 extern "c" fn waitpid(pid: c_int, status: ?*c_int, opts: c_int) c_int;
 extern "c" fn _exit(status: c_int) noreturn;
 
-const F_GETFL: c_int = 3;
+const F_GETFL: c_int = 3; // kept for reference; fcntlc.F_GETFL used below
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0x0004; // Darwin
 const EAGAIN: c_int = 35; // Darwin
 
 fn setNonblock(fd: c_int) void {
-    const cur = fcntl(fd, F_GETFL, 0);
+    const cur = fcntlc.fcntl(fd, fcntlc.F_GETFL, @as(c_int, 0));
     if (cur < 0) return;
-    _ = fcntl(fd, F_SETFL, cur | O_NONBLOCK);
+    _ = fcntlc.fcntl(fd, fcntlc.F_SETFL, cur | @as(c_int, fcntlc.O_NONBLOCK));
 }
 
 fn lastErrno() c_int {
@@ -220,16 +227,33 @@ fn benchHandoff(key: []const u8, nbytes: usize) !void {
         r.unlink();
     }
 
+    // A-fast: no-CRC put + lock-free no-CRC get (the shipped fast path).
     for (0..runs) |i| {
         var r = try zcs.Region.open(key, @max(nbytes, 4096));
         defer r.detach();
         const t0 = nowNs();
-        try r.put(blob); // writer side of the hand-off
+        try r.putNoCrc(blob); // fast path: no CRC over the payload
+        const dst = try alloc.alloc(u8, nbytes);
+        defer alloc.free(dst);
+        const got = (try r.getLockFreeNoCrc(dst)) orelse return error.TornRead;
+        if (got.len == nbytes and std.mem.eql(u8, got, blob)) sum_ok += 1;
+        times_a[i] = nowNs() - t0;
+    }
+
+    // A-crc: CRC-checked put + lock-free get with CRC verify (integrity
+    // cost paid twice per blob: once on write, once on read).
+    var times_ac: [32]u64 = undefined;
+    var sum_ok_crc: usize = 0;
+    for (0..runs) |i| {
+        var r = try zcs.Region.open(key, @max(nbytes, 4096));
+        defer r.detach();
+        const t0 = nowNs();
+        try r.put(blob);
         const dst = try alloc.alloc(u8, nbytes);
         defer alloc.free(dst);
         const got = (try r.getLockFree(dst)) orelse return error.TornRead;
-        if (got.len == nbytes and std.mem.eql(u8, got, blob)) sum_ok += 1;
-        times_a[i] = nowNs() - t0;
+        if (got.len == nbytes and std.mem.eql(u8, got, blob)) sum_ok_crc += 1;
+        times_ac[i] = nowNs() - t0;
     }
 
     // B: fork a child that reads N bytes from a pipe and writes them back.
@@ -289,6 +313,7 @@ fn benchHandoff(key: []const u8, nbytes: usize) !void {
             }
             if ((pfd[1].revents & @as(c_short, pollc.POLLIN | pollc.POLLERR | pollc.POLLHUP)) != 0) {
                 const rd = read(c2p[0], blob.ptr + got, @min(nbytes - got, 65536));
+                if (rd < 0 and lastErrno() == EAGAIN) continue; // drained for now
                 if (rd <= 0) break;
                 got += @intCast(rd);
             }
@@ -301,14 +326,16 @@ fn benchHandoff(key: []const u8, nbytes: usize) !void {
     }
 
     std.mem.sort(u64, times_a[0..runs], {}, std.sort.asc(u64));
+    std.mem.sort(u64, times_ac[0..runs], {}, std.sort.asc(u64));
     std.mem.sort(u64, times_b[0..runs], {}, std.sort.asc(u64));
-    std.debug.print("hand-off {d} bytes, {d} runs, verified {d}/{d}\n", .{ nbytes, runs, sum_ok, runs });
+    std.debug.print("hand-off {d} bytes, {d} runs, verified noCrc {d}/{d}, crc {d}/{d}\n", .{ nbytes, runs, sum_ok, runs, sum_ok_crc, runs });
     std.debug.print("A zerocopy-state (put+lockfree-get): median {d} us\n", .{times_a[runs / 2] / 1000});
-    std.debug.print("B fork/exec+pipe (cat echo):         median {d} us\n", .{times_b[runs / 2] / 1000});
-    if (times_b[runs / 2] > 0) {
-        const speedup = @as(f64, @floatFromInt(times_b[runs / 2])) / @as(f64, @floatFromInt(@max(1, times_a[runs / 2])));
-        std.debug.print("speedup A vs B: {d:.1}x\n", .{speedup});
+    const speedup = @as(f64, @floatFromInt(times_b[runs / 2])) / @as(f64, @floatFromInt(@max(1, times_a[runs / 2])));
+    if (times_ac[runs / 2] > 0) {
+        std.debug.print("A zerocopy-state CRC (put+crc-get):  median {d} us\n", .{times_ac[runs / 2] / 1000});
     }
+    std.debug.print("B fork/exec+pipe (cat echo):         median {d} us\n", .{times_b[runs / 2] / 1000});
+    std.debug.print("speedup A-nocrc vs B: {d:.1}x | A-crc vs B: {d:.1}x\n", .{ speedup, @as(f64, @floatFromInt(times_b[runs / 2])) / @as(f64, @floatFromInt(@max(1, times_ac[runs / 2]))) });
     // Cleanup so a later run at a different size does not inherit capacity.
     zcs.unlinkKey(key);
 }

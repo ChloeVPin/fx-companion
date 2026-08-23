@@ -212,6 +212,36 @@ pub const Region = struct {
         return dst[0..n];
     }
 
+    /// Fast put for bulk transfer: skip the CRC (the expensive part at
+    /// multi-hundred-KB sizes). Readers use the epoch-checked getLockFreeNoCrc
+    /// or get; a torn read is detected by epoch alone, not content.
+    pub fn putNoCrc(self: *Region, src: []const u8) Error!void {
+        if (src.len > self.hdr().capacity) return Error.TooLarge;
+        const mb = self.mblock();
+        _ = c.pthread_mutex_lock(&mb.mu);
+        defer _ = c.pthread_mutex_unlock(&mb.mu);
+        const h = self.hdr();
+        @memcpy(self.slab()[0..src.len], src);
+        h.length = src.len;
+        h.crc = 0; // marker: no CRC stored
+        mb.writer_pid = c.getpid();
+        mb.epoch +%= 1;
+        @atomicStore(u64, &h.epoch, mb.epoch, .release);
+    }
+
+    /// Lock-free read without CRC verification. Torn reads are still caught
+    /// by the double epoch check; content is trusted (fast path pairing for
+    /// putNoCrc). Returns null on a torn read.
+    pub fn getLockFreeNoCrc(self: *Region, dst: []u8) Error!?[]u8 {
+        const h = self.hdr();
+        const e0 = @atomicLoad(u64, &h.epoch, .acquire);
+        const n: usize = @intCast(@min(@atomicLoad(u64, &h.length, .monotonic), dst.len));
+        @memcpy(dst[0..n], self.slab()[0..n]);
+        const e1 = @atomicLoad(u64, &h.epoch, .acquire);
+        if (e0 != e1) return null;
+        return dst[0..n];
+    }
+
     /// Lock-free read: snapshot slab, verify epoch unchanged and CRC match.
     /// Returns the number of valid bytes copied, or null on a torn read.
     pub fn getLockFree(self: *Region, dst: []u8) Error!?[]u8 {

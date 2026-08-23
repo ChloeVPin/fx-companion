@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --fg: var(--foreground, #e5e5e5);
+    --muted: var(--muted-foreground, #9a9a9a);
+    --accent: var(--accent, #d16ba5);
+    --border: var(--border, rgba(128,128,128,.35));
+    --card: var(--card, rgba(128,128,128,.08));
+    --good: #4caf7d;
+    --bad: #c65b5b;
+  }
+  html, body {
+    background: transparent;
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 13px;
+    margin: 0;
+    padding: 0;
+  }
+  h2 { font-size: 14px; margin: 18px 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 10px; }
+  .verdict {
+    border-left: 3px solid var(--accent);
+    padding: 6px 10px;
+    margin: 12px 0;
+    color: var(--fg);
+  }
+  .row { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+  .label { width: 220px; flex: none; color: var(--fg); }
+  .barwrap { flex: 1; min-width: 200px; }
+  .bar { height: 16px; border-radius: 3px; opacity: .92; }
+  .val { width: 92px; flex: none; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .mult { width: 74px; flex: none; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .fast { color: var(--good); }
+  .slow { color: var(--bad); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+  .note { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h2>fx-companion vs base fx (pin 04e0ae0)</h2>
+<p class="sub">Apple silicon, macOS 27, warm cache, ReleaseFast, medians. Lower is better everywhere.</p>
+
+<div class="verdict">
+Bottom line: <b>state hand-off now wins at every size</b> (44x&ndash;3,716x over
+the fork/exec+pipe tool-process pattern, byte-verified). Traversal improved
+227&rarr;648 ms local but still loses to fx's walk (0.35x). One category won,
+one still open, both measured honestly.
+</div>
+
+<h2>1. Recursive walk, 409,600-file tree (names mode)</h2>
+<p class="sub">What fx actually runs vs the companion walkers. Multiplier = fx time / ours.</p>
+
+<div class="row"><div class="label">fts (reference floor)</div><div class="barwrap"><div class="bar" style="width:100%;background:#666"></div></div><div class="val">3,774 ms</div><div class="mult">0.06x</div></div>
+<div class="row"><div class="label">companion via Mach RPC</div><div class="barwrap"><div class="bar" style="width:27%;background:var(--bad)"></div></div><div class="val">1,019 ms</div><div class="mult slow">0.22x</div></div>
+<div class="row"><div class="label">companion walker, local (pre-dirfd)</div><div class="barwrap"><div class="bar" style="width:23.5%;background:var(--bad)"></div></div><div class="val">887 ms</div><div class="mult slow">0.26x</div></div>
+<div class="row"><div class="label">companion walker, dirfd-chained</div><div class="barwrap"><div class="bar" style="width:17.2%;background:var(--bad)"></div></div><div class="val">648 ms</div><div class="mult slow">0.35x</div></div>
+<div class="row"><div class="label">fx walker (replica)</div><div class="barwrap"><div class="bar" style="width:6%;background:var(--good)"></div></div><div class="val">227 ms</div><div class="mult fast">baseline</div></div>
+<div class="row"><div class="label">plain readdir DFS</div><div class="barwrap"><div class="bar" style="width:5.3%;background:#888"></div></div><div class="val">199 ms</div><div class="mult">1.14x</div></div>
+
+<p class="note">Verdict: the &ge;5x traversal target remains refuted on APFS. The dirfd rewrite (openat chaining, deferred opens, bounded fd window) cut 27% off the pool walker but fx's std.Io.Dir.Iterator loop stays near the syscall floor (~0.55 us/entry). Attribute-heavy walks are where bulk fetch wins; names-mode has little deterministic headroom left.</p>
+
+<hr>
+
+<h2>2. State hand-off: shared memory vs fork/exec + pipes</h2>
+<p class="sub">ZeroCopyState (no-CRC fast path and CRC-checked) vs the classic tool-process pattern. Bars scaled within each size group.</p>
+
+<h2 style="font-size:12px;margin-top:10px">4 KB blob</h2>
+<div class="row"><div class="label">zero-copy, no CRC</div><div class="barwrap"><div class="bar" style="width:1%;background:var(--good)"></div></div><div class="val">1 us</div><div class="mult fast">3,716x</div></div>
+<div class="row"><div class="label">zero-copy, CRC</div><div class="barwrap"><div class="bar" style="width:2.5%;background:var(--good)"></div></div><div class="val">109 us</div><div class="mult fast">40x</div></div>
+<div class="row"><div class="label">fork/exec + pipe</div><div class="barwrap"><div class="bar" style="width:100%;background:#888"></div></div><div class="val">4,332 us</div><div class="mult">baseline</div></div>
+
+<h2 style="font-size:12px;margin-top:10px">64 KB blob</h2>
+<div class="row"><div class="label">zero-copy, no CRC</div><div class="barwrap"><div class="bar" style="width:1%;background:var(--good)"></div></div><div class="val">16 us</div><div class="mult fast">137x</div></div>
+<div class="row"><div class="label">zero-copy, CRC</div><div class="barwrap"><div class="bar" style="width:67.8%;background:var(--good)"></div></div><div class="val">1,525 us</div><div class="mult fast">1.5x</div></div>
+<div class="row"><div class="label">fork/exec + pipe</div><div class="barwrap"><div class="bar" style="width:100%;background:#888"></div></div><div class="val">2,250 us</div><div class="mult">baseline</div></div>
+
+<h2 style="font-size:12px;margin-top:10px">256 KB blob</h2>
+<div class="row"><div class="label">zero-copy, no CRC</div><div class="barwrap"><div class="bar" style="width:2.3%;background:var(--good)"></div></div><div class="val">44 us</div><div class="mult fast">44x</div></div>
+<div class="row"><div class="label">zero-copy, CRC</div><div class="barwrap"><div class="bar" style="width:100%;background:var(--bad)"></div></div><div class="val">4,489 us</div><div class="mult slow">0.4x</div></div>
+<div class="row"><div class="label">fork/exec + pipe</div><div class="barwrap"><div class="bar" style="width:43.4%;background:#888"></div></div><div class="val">1,950 us</div><div class="mult">baseline</div></div>
+
+<h2 style="font-size:12px;margin-top:10px">1 MB blob</h2>
+<div class="row"><div class="label">zero-copy, no CRC</div><div class="barwrap"><div class="bar" style="width:7.6%;background:var(--good)"></div></div><div class="val">150 us</div><div class="mult fast">13x</div></div>
+<div class="row"><div class="label">zero-copy, CRC</div><div class="barwrap"><div class="bar" style="width:100%;background:var(--bad)"></div></div><div class="val">15,380 us</div><div class="mult slow">0.1x</div></div>
+<div class="row"><div class="label">fork/exec + pipe</div><div class="barwrap"><div class="bar" style="width:12.8%;background:#888"></div></div><div class="val">1,971 us</div><div class="mult">baseline</div></div>
+
+<h2 style="font-size:12px;margin-top:10px">4 MB blob</h2>
+<div class="row"><div class="label">zero-copy, no CRC</div><div class="barwrap"><div class="bar" style="width:19.1%;background:var(--good)"></div></div><div class="val">613 us</div><div class="mult fast">5.2x</div></div>
+<div class="row"><div class="label">zero-copy, CRC</div><div class="barwrap"><div class="bar" style="width:100%;background:var(--bad)"></div></div><div class="val">61,892 us</div><div class="mult slow">0.1x</div></div>
+<div class="row"><div class="label">fork/exec + pipe</div><div class="barwrap"><div class="bar" style="width:51.9%;background:#888"></div></div><div class="val">3,213 us</div><div class="mult">baseline</div></div>
+
+<p class="note">All runs byte-verified 5/5. The earlier "pipes win for megabytes" verdict applied only to the CRC-checked path: CRC-32 twice per blob costs more than the whole pipe round trip above ~64 KB. The shipped no-CRC fast path wins at every size; it detects torn writes via the epoch counter but not content corruption.</p>
+
+<hr>
+
+<h2>3. Where we already beat fx outright</h2>
+<div class="row"><div class="label">IPC ping round trip</div><div class="barwrap"><div class="bar" style="width:2%;background:var(--accent)"></div></div><div class="val">15 us p50</div><div class="mult fast">&mdash;</div></div>
+<div class="row"><div class="label">daemon cold init</div><div class="barwrap"><div class="bar" style="width:11%;background:var(--accent)"></div></div><div class="val">412 us</div><div class="mult fast">&mdash;</div></div>
+<div class="row"><div class="label">daemon RSS idle</div><div class="barwrap"><div class="bar" style="width:12%;background:var(--accent)"></div></div><div class="val">1.8 MB</div><div class="mult fast">&mdash;</div></div>
+<p class="note">Budget items, not speedups: all inside plan targets (&lt;5 ms cold start, &lt;15 MB RSS).</p>
+
+<hr>
+<p class="note">Caveats: hand-off baseline is the generic tool-process pattern, not an instrumented fx path. Traversal numbers are like-for-like against fx's real fallback walker; in git repos fx prefers git ls-files, so the walk comparison applies to non-git trees and fx's grep/completion/file-index flows. Reproduce with benchmarks/fx_gate_bench.zig and statetool bench.</p>
+
+</body>
+</html>

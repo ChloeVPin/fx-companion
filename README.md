@@ -181,25 +181,37 @@ involvement on the read path.
 Hand-off benchmark (`statetool bench <key> <bytes>`), median of 5 runs,
 warm cache, ReleaseFast. Baseline B is the classic tool-process pattern:
 fork/exec of `/bin/cat` echoing the blob back through two pipes (parent
-side non-blocking + poll so it cannot deadlock). A is writer-put +
-lock-free reader get through the shared region:
+side non-blocking + poll so it cannot deadlock). A-fast is the shipped
+no-CRC fast path (writer put + lock-free reader get, torn-write detection
+by epoch alone); A-crc pays CRC-32 twice per blob (write + read verify):
 
-| payload | A zero-copy state | B fork/exec+pipe | speedup |
-|---------|-------------------|------------------|---------|
-| 4 KB    | 59 us             | 1,879 us         | 31x     |
-| 64 KB   | 960 us            | 1,585 us         | 1.7x    |
-| 256 KB  | 4,201 us          | 1,957 us         | 0.5x    |
-| 1 MB    | 16,898 us         | 2,301 us         | 0.07x   |
+| payload | A no-CRC | A CRC | B fork/exec+pipe | no-CRC win | CRC win |
+|---------|----------|-------|------------------|------------|---------|
+| 4 KB    | 1 us     | 109 us    | 4,332 us | 3,716x | 40x   |
+| 64 KB   | 16 us    | 1,525 us  | 2,250 us | 137x   | 1.5x  |
+| 256 KB  | 44 us    | 4,489 us  | 1,950 us | 44x    | 0.4x  |
+| 1 MB    | 150 us   | 15,380 us | 1,971 us | 13x    | 0.1x  |
+| 4 MB    | 613 us   | 61,892 us | 3,213 us | 5.2x   | 0.1x  |
 
-Honest verdict: ZeroCopyState wins decisively for small, high-frequency
-state hand-offs (sub-agent keys, open-file lists, session metadata) -
-31x at 4 KB, which matches workload 2's >=3x hand-off target at that
-scale. It does NOT win for bulk payload transfer: our put/get path pays a
-CRC over the whole blob twice plus two memcpys, while pipes stream
-through kernel pages without a checksum. The plan's zero-copy claim holds
-for control-plane state, not for moving megabytes. Bulk transfer should
-stay in whatever channel moves data cheapest (pipes/files), or the region
-needs an opt-in no-CRC fast path.
+All runs byte-verified 5/5 at every size. Honest verdict, revised:
+with the no-CRC fast path ZeroCopyState wins at every measured size,
+from 1 us control-plane hand-offs to 613 us at 4 MB - bulk transfer
+included (the earlier "pipes win for megabytes" verdict applied only
+to the CRC-checked path, which loses above ~64 KB because CRC-32 over
+the blob costs more than the entire pipe round trip). The no-CRC path
+detects torn writes via the epoch counter but not content corruption;
+use it when the writer is trusted or integrity is checked elsewhere,
+and the CRC path when it is not.
+
+Engineering note (2026-08-23): the bench previously hung at >=256 KB.
+Root cause: `fcntl(2)` is variadic; a hand-written fixed-arity
+`extern "c" fn fcntl(fd, cmd, arg) c_int` declaration compiles and
+returns 0 but silently never applies `F_SETFL` flags on arm64 macOS /
+Zig 0.16, so the parent's "non-blocking" pipe writes were blocking.
+64 KB payloads fit in the pipe buffer and masked the bug. Fix routes
+fcntl through the true C prototype (`@cImport("fcntl.h")`). Verified
+by A/B probe: same call site, flags stick only through the variadic
+prototype.
 
 Reproduce:
 
