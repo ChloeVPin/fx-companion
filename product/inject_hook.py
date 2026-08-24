@@ -112,6 +112,12 @@ def main() -> int:
 
     # --- ui/render.zig: BOOSTED badge in the welcome header ---
     rtext = render.read_text()
+    if "badge_buf: [128]u8" in rtext and "boostedBadge" in rtext:
+        # older injections used a 128-byte buffer; the badge outgrew it
+        rtext = rtext.replace("var badge_buf: [128]u8 = undefined;",
+                              "var badge_buf: [512]u8 = undefined;", 1)
+        render.write_text(rtext)
+        print("inject: upgraded badge buffer 128 -> 512")
     if "boostedBadge" in rtext:
         print("inject: badge already present")
     else:
