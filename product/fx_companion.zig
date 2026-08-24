@@ -135,7 +135,155 @@ pub fn boostedBadge(buf: []u8) []const u8 {
     }
     const tail = std.fmt.bufPrint(buf[w..], "\x1b[0m", .{}) catch return buf[0..0];
     w += tail.len;
+    // Leading space keeps the badge visually separated from the version label.
+    if (w + 1 < buf.len) {
+        std.mem.copyBackwards(u8, buf[1 .. w + 1], buf[0..w]);
+        buf[0] = ' ';
+        w += 1;
+    }
     return buf[0..w];
+}
+
+// ---------------------------------------------------------------- benchmark
+
+extern "c" fn opendir(path: [*]const u8) ?*anyopaque;
+extern "c" fn readdir(dirp: *anyopaque) ?[*]u8;
+extern "c" fn closedir(dirp: *anyopaque) c_int;
+extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+
+const Timespec = extern struct { sec: isize, nsec: isize };
+fn nowNs() u64 {
+    var ts: Timespec = undefined;
+    _ = clock_gettime(4, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+fn median3(a: u64, b: u64, t3: u64) u64 {
+    var lo = @min(a, b);
+    _ = &lo;
+    return @min(@max(a, b), t3);
+}
+
+/// Single-threaded readdir DFS — syscall-for-syscall what stock fx's walker
+/// does. This is the baseline /benchmark measures against.
+fn referenceWalk(
+    arena: std.mem.Allocator,
+    root: []const u8,
+    out_count: *usize,
+) !void {
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, try arena.dupeZ(u8, ""));
+    defer {
+        for (stack.items) |item| arena.free(item);
+        stack.deinit(arena);
+    }
+    var pathbuf: [4096]u8 = undefined;
+    while (stack.pop()) |prefix| {
+        const plen = if (prefix.len == 0)
+            (std.fmt.bufPrintZ(&pathbuf, "{s}", .{root}) catch continue).len
+        else
+            (std.fmt.bufPrintZ(&pathbuf, "{s}/{s}", .{ root, prefix }) catch continue).len;
+        const dp = opendir(pathbuf[0..plen].ptr) orelse continue;
+        while (true) {
+            const dent = readdir(dp) orelse break;
+            const reclen = std.mem.readInt(u16, dent[16..18], .little);
+            if (reclen == 0) break;
+            const namlen: usize = std.mem.readInt(u16, dent[18..20], .little);
+            const dtype = dent[20];
+            const name = dent[21 .. 21 + namlen];
+            if (name.len == 1 and name[0] == '.') continue;
+            if (name.len == 2 and name[0] == '.' and name[1] == '.') continue;
+            if (dtype != 4) {
+                // stock fx counts every non-directory entry, hidden files included
+                out_count.* += 1;
+                continue;
+            }
+            if (isHiddenName(name)) continue;
+            if (isIgnoredName(&.{ ".git", ".zig-cache", "zig-out", "node_modules", ".next", "dist", "build", "coverage" }, name)) continue;
+            const child = if (prefix.len == 0)
+                try arena.dupeZ(u8, name)
+            else
+                try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ prefix, name }, 0);
+            try stack.append(arena, child);
+        }
+        _ = closedir(dp);
+        arena.free(prefix);
+    }
+}
+
+/// Runs the raw speed benchmark and renders a report into `out`.
+/// Compares the accelerated pool walk against a stock-equivalent
+/// single-threaded walk over the same tree, three rounds each, medians.
+pub fn runBenchmark(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    out: *std.ArrayListUnmanaged(u8),
+) !void {
+    var aw: std.Io.Writer.Allocating = .fromArrayList(arena, out);
+    const w = &aw.writer;
+    const rounds = 3;
+
+    // --- accelerated walk ---
+    var comp_times: [3]u64 = undefined;
+    var comp_count: usize = 0;
+    var incomplete = false;
+    for (0..rounds) |i| {
+        var paths: std.ArrayList([]const u8) = .empty;
+        var overlong: usize = 0;
+        const t0 = nowNs();
+        const inc = walkPaths(
+            arena,
+            workspace_root,
+            &.{ ".git", ".zig-cache", "zig-out", "node_modules", ".next", "dist", "build", "coverage" },
+            null,
+            true,
+            false,
+            std.math.maxInt(usize),
+            4096,
+            null,
+            &paths,
+            &overlong,
+        ) catch |err| {
+            try w.print("walk failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        comp_times[i] = nowNs() - t0;
+        comp_count = paths.items.len;
+        incomplete = inc;
+    }
+    const comp_med = median3(comp_times[0], comp_times[1], comp_times[2]);
+
+    // --- stock-equivalent reference ---
+    var ref_times: [3]u64 = undefined;
+    var ref_count: usize = 0;
+    for (0..rounds) |i| {
+        var arena_ref = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer arena_ref.deinit();
+        ref_count = 0;
+        const t0 = nowNs();
+        referenceWalk(arena_ref.allocator(), workspace_root, &ref_count) catch return;
+        ref_times[i] = nowNs() - t0;
+    }
+    const ref_med = median3(ref_times[0], ref_times[1], ref_times[2]);
+
+    const speedup = if (comp_med > 0)
+        @as(f64, @floatFromInt(ref_med)) / @as(f64, @floatFromInt(comp_med))
+    else
+        0;
+
+    try w.writeAll("⚡ fx-companion benchmark\n\n");
+    try w.print("  tree          {s}\n", .{workspace_root});
+    try w.print("  files         companion={d} reference={d}{s}\n", .{
+        comp_count,
+        ref_count,
+        if (comp_count == ref_count) "  ✓ match" else "  ✗ MISMATCH",
+    });
+    if (incomplete) try w.writeAll("  (walk reported incomplete)\n");
+    try w.print("  stock-equiv   {d:.1} ms  (median of {d})\n", .{ @as(f64, @floatFromInt(ref_med)) / 1e6, rounds });
+    try w.print("  accelerated   {d:.1} ms  (median of {d}, 8 workers)\n", .{ @as(f64, @floatFromInt(comp_med)) / 1e6, rounds });
+    try w.print("  speedup       {d:.2}x\n", .{speedup});
+    try w.writeAll("\n  FX_NO_COMPANION=1 disables the fast path.\n");
+    out.* = aw.toArrayList();
 }
 
 fn isIgnoredName(ignored: []const []const u8, name: []const u8) bool {

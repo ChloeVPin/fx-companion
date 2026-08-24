@@ -114,19 +114,75 @@ def main() -> int:
     rtext = render.read_text()
     if "boostedBadge" in rtext:
         print("inject: badge already present")
+    else:
+        if WELCOME_OLD not in rtext:
+            print("inject: anchor not found (welcomeMessage)", file=sys.stderr)
+            return 1
+        rtext = rtext.replace(WELCOME_OLD, WELCOME_NEW, 1)
+        m = re.search(r'(const main = @import\("\.\./main\.zig"\);\n)', rtext)
+        if not m:
+            print("inject: anchor not found (render import)", file=sys.stderr)
+            return 1
+        rtext = rtext.replace(m.group(1),
+                              m.group(1) + 'const fx_companion = @import("../core/workspace/fx_companion.zig");\n', 1)
+        render.write_text(rtext)
+        print("inject: badge applied to", render)
+
+    # --- app_commands.zig: /benchmark slash command (ours, via unknown-cmd hook) ---
+    appc = src / "src" / "core" / "app" / "app_commands.zig"
+    if not appc.exists():
+        print("inject: missing app_commands.zig", file=sys.stderr)
+        return 1
+    atext = appc.read_text()
+    if "/benchmark" in atext:
+        print("inject: benchmark already present")
         return 0
-    if WELCOME_OLD not in rtext:
-        print("inject: anchor not found (welcomeMessage)", file=sys.stderr)
+    old_unknown = '''        fn commandUnknown(ctx: *anyopaque, _: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app.writeDomainNotice(.{
+                .topic = "command",
+                .tone = .@"error",
+                .body = "Unknown command. Try /help.",
+            }, true);
+        }'''
+    new_unknown = '''        fn commandUnknown(ctx: *anyopaque, cmd_raw: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            // fx-companion: /benchmark is ours — raw speed tests, no model call.
+            if (std.mem.startsWith(u8, cmd_raw, "/benchmark")) {
+                var body: std.ArrayListUnmanaged(u8) = .empty;
+                fx_companion.runBenchmark(app.alloc, app.workspace_root, &body) catch |err| {
+                    body.deinit(app.alloc);
+                    try app.writeDomainNotice(.{
+                        .topic = "benchmark",
+                        .tone = .@"error",
+                        .body = try std.fmt.allocPrint(app.alloc, "benchmark failed: {s}", .{@errorName(err)}),
+                    }, true);
+                    return;
+                };
+                try app.writeDomainNotice(.{ .topic = "benchmark", .tone = .neutral, .body = body.items }, true);
+                return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "command",
+                .tone = .@"error",
+                .body = "Unknown command. Try /help. (Tip: /benchmark runs fx-companion speed tests.)",
+            }, true);
+        }'''
+    if old_unknown not in atext:
+        print("inject: anchor not found (commandUnknown)", file=sys.stderr)
         return 1
-    rtext = rtext.replace(WELCOME_OLD, WELCOME_NEW, 1)
-    m = re.search(r'(const main = @import\("\.\./main\.zig"\);\n)', rtext)
-    if not m:
-        print("inject: anchor not found (render import)", file=sys.stderr)
-        return 1
-    rtext = rtext.replace(m.group(1),
-                          m.group(1) + 'const fx_companion = @import("../core/workspace/fx_companion.zig");\n', 1)
-    render.write_text(rtext)
-    print("inject: badge applied to", render)
+    atext = atext.replace(old_unknown, new_unknown, 1)
+    m3 = re.search(r'(const io_mod = @import\("[^"]*shared/io\.zig"\);\n)', atext)
+    anchor_imp = None
+    for pat in [r'(const command_router = @import\("[^"]*command_router\.zig"\);\n)', r'(const std = @import\("std"\);\n)']:
+        m3 = re.search(pat, atext)
+        if m3:
+            anchor_imp = m3.group(1)
+            break
+    atext = atext.replace(anchor_imp, anchor_imp +
+        'const fx_companion = @import("../workspace/fx_companion.zig");\n', 1)
+    appc.write_text(atext)
+    print("inject: /benchmark applied to", appc)
     _ = changed
     return 0
 
