@@ -6,7 +6,7 @@
 
 **Stock output. Faster traversal. Zero config.**
 
-[![Homebrew](https://img.shields.io/badge/install-brew-9cf)](https://github.com/ChloeVPin/homebrew-tap)
+[![Install](https://img.shields.io/badge/install-npx-9cf)](#install)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black)](https://github.com/ChloeVPin/fx-companion)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Tests](https://img.shields.io/badge/equivalence-byte--identical-success)](#how-it-works)
@@ -20,30 +20,31 @@
 <div align="center">
 
 ```sh
-brew tap chloevpin/tap && brew install fx-companion
+npx github:ChloeVPin/fx-companion
 ```
 
-**That's it.** Run `fx` like you always do — same commands, same output,
-faster where it counts. Your session header greets you with a gradient
-<span>**✦ BOOSTED**</span> badge so you always know which fx you're running.
+**That's it.** Downloads the prebuilt binary (checksum-verified), retires any
+stock fx you had — sessions, skills, and settings stay untouched — and you're
+done.
 
 </div>
 
 > [!NOTE]
-> If a stock `fx` already lives in `~/.local/bin`, Homebrew may warn about a
-> shadowed command. Make sure `/opt/homebrew/bin` comes first on your `PATH`,
-> or just replace the old binary.
+> Requires macOS on Apple Silicon and Node 18+. If `~/.local/bin` precedes the
+> npx install dir on your PATH, add this to your `~/.zshrc`:
+> `export PATH="$HOME/.fx-companion/bin:$PATH"`
 
 <details>
-<summary>No Homebrew? One-line curl install instead</summary>
+<summary><b>Commands</b></summary>
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ChloeVPin/fx-companion/main/bootstrap.sh | sh
+npx github:ChloeVPin/fx-companion install   # default: download + replace + activate
+npx github:ChloeVPin/fx-companion status    # what's installed, which fx wins on PATH
 ```
 
-Requires Zig (`brew install zig`). Builds from source into `~/.fx-companion/bin`.
-
 </details>
+
+---
 
 ## Why
 
@@ -109,7 +110,7 @@ graceful fallback. Remove the module and you have exactly stock fx.
 <details>
 <summary><b>How do I go back to stock?</b></summary>
 
-`brew uninstall fx-companion` — or run `FX_NO_COMPANION=1 fx …` to skip the
+Delete `~/.fx-companion/bin/fx` (or restore your `.stock.bak` backup) — or run `FX_NO_COMPANION=1 fx …` to skip the
 booster per-invocation without uninstalling.
 </details>
 
