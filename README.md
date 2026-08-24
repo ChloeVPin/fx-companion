@@ -68,9 +68,12 @@ benchmarks/run_discover_bench.sh /tmp/fxanchor-new 7 100000
 benchmarks/run_discover_bench.sh /tmp/fxanchor-new 7 600000
 ```
 
-In any session, `/benchmark` reports cold traversal, warm validation and
-materialization, directory-read syscalls and bytes, retained cache memory,
-median, and best. It makes no synthetic or paid model request.
+In any session, `/benchmark` first applies a 10,000-path / 100 ms
+responsiveness guard. Small workspaces get the full seven-round cold/warm
+profile with median and best; larger workspaces get an honest bounded syscall
+profile with no speedup claim instead of blocking the terminal. It makes no
+synthetic or paid model request. Use the runner above for full large-tree
+measurements.
 
 FSEvents-only invalidation was rejected. A synchronous flush took 0.012 ms,
 but an immediate file creation was not visible until 11.741 ms and nine

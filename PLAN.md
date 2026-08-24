@@ -23,6 +23,8 @@ Primary focus is deterministic acceleration. Speculative features are strictly o
   validated byte-identical snapshot. Source-order calls always stay stock.
 - Public-API equivalence gate covers ordering, cap metadata, hidden paths, Git ignores,
   symlinks, special files, cache hits, create/delete invalidation, and content-only hits.
+- `/benchmark` guards the interactive thread with a 10,000-path / 100 ms preflight;
+  large trees return a bounded no-claim profile instead of blocking on an uncacheable walk.
 - FSEvents-only invalidation rejected: the immediate post-create synchronous flush missed
   the event; reproducible result is recorded under `benchmarks/results/`.
 

@@ -80,6 +80,36 @@ lanes × 10,000 iterations) and 1,000 mid-walk cancellations without a
 mismatch or deadlock. The public release gate repeats smaller versions of both
 soaks in addition to the public-API equivalence matrix.
 
+## Interactive `/benchmark` responsiveness regression
+
+Release v0.2.1 ran the full cache-dependent profile synchronously before it
+knew whether the workspace could retain a snapshot. From `/Users/chloe`, the
+standalone owner reproduced the UI path in 23.04 seconds and ended with
+`profile unavailable: CacheUnavailable`.
+
+The v0.2.2 path first runs an uncached probe bounded by 10,000 paths and a
+100 ms cancellation guard. The same root completed the diagnostic in 0.04
+seconds, reported 10,000 paths and `incomplete=true`, and made no equivalence
+or speedup claim for that subset. This is a single before/after regression
+measurement, not a throughput benchmark or median.
+
+```sh
+for ref in v0.2.1 v0.2.2; do
+  product_tmp=$(mktemp -d /tmp/fxc-product.XXXXXX)
+  source_tmp=$(mktemp -d /tmp/fxc-source.XXXXXX)
+  git archive "$ref" | tar -x -C "$product_tmp"
+  git -C ~/Developer/fx-upstream archive "$(cat "$product_tmp/PINNED_FX")" | tar -x -C "$source_tmp"
+  python3 "$product_tmp/product/inject_hook.py" "$source_tmp"
+  cp "$product_tmp/benchmarks/profile_output_probe.zig" "$source_tmp/src/fx_companion_profile_output_probe.zig"
+  (cd "$source_tmp" && zig build-exe src/fx_companion_profile_output_probe.zig -lc -OReleaseFast -femit-bin="$source_tmp/profile-probe")
+  /usr/bin/time -p "$source_tmp/profile-probe" /Users/chloe
+done
+```
+
+A deterministic 10,100-file fixture also exercises the responsive branch in
+the public release gate. A small fixture separately requires the full
+seven-round output, so the guard cannot silently replace every profile.
+
 ## Rejected: FSEvents-only invalidation
 
 `FSEventStreamFlushSync` itself measured 0.012 ms median, but the first flush

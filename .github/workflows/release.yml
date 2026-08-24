@@ -47,19 +47,24 @@ jobs:
 
       - name: Equivalence self-test (byte-identical or bust)
         run: |
+          zig build-exe benchmarks/make_anchor.zig -lc -OReleaseFast -femit-bin=/tmp/make-anchor
           cp product/tests_fxcompanion.zig fx-src/src/tests_fxcompanion.zig
           cp benchmarks/concurrent_cache_probe.zig fx-src/src/fx_companion_concurrent_cache_probe.zig
           cp benchmarks/cancellation_probe.zig fx-src/src/fx_companion_cancellation_probe.zig
+          cp benchmarks/profile_output_probe.zig fx-src/src/fx_companion_profile_output_probe.zig
           cd fx-src
           zig build-exe src/tests_fxcompanion.zig -lc -OReleaseFast -femit-bin=/tmp/equiv-probe
           zig build-exe src/fx_companion_concurrent_cache_probe.zig -lc -OReleaseFast -femit-bin=/tmp/concurrent-cache-probe
           zig build-exe src/fx_companion_cancellation_probe.zig -lc -OReleaseFast -femit-bin=/tmp/cancellation-probe
+          zig build-exe src/fx_companion_profile_output_probe.zig -lc -OReleaseFast -femit-bin=/tmp/profile-output-probe
 
           TINY=$(mktemp -d /tmp/fxc-tiny.XXXXXX)
           CAPPED=$(mktemp -d /tmp/fxc-capped.XXXXXX)
           EMPTY=$(mktemp -d /tmp/fxc-empty.XXXXXX)
           DEEP=$(mktemp -d /tmp/fxc-deep.XXXXXX)
-          trap 'rm -rf -- "$TINY" "$CAPPED" "$EMPTY" "$DEEP"' EXIT
+          PROFILE_PARENT=$(mktemp -d /tmp/fxc-profile.XXXXXX)
+          PROFILE_LARGE="$PROFILE_PARENT/tree"
+          trap 'rm -rf -- "$TINY" "$CAPPED" "$EMPTY" "$DEEP" "$PROFILE_PARENT"' EXIT
 
           mkdir -p "$TINY/src/deep" "$TINY/node_modules/pkg" \
                    "$TINY/.hidden/deep" "$TINY/ignored/deep"
@@ -87,6 +92,7 @@ jobs:
             done
             touch leaf.txt
           )
+          /tmp/make-anchor "$PROFILE_LARGE" 101 100
 
           /tmp/equiv-probe "$TINY" 100000 --mutation-check
           /tmp/equiv-probe "$CAPPED" 50 --mutation-check
@@ -96,9 +102,12 @@ jobs:
           /tmp/equiv-probe /opt/homebrew 600000
           /tmp/concurrent-cache-probe "$TINY" 1000
           /tmp/cancellation-probe /opt/homebrew 100
+          /tmp/profile-output-probe "$TINY" --require-full
+          /tmp/profile-output-probe "$PROFILE_LARGE" --require-responsive
           rm -f src/tests_fxcompanion.zig \
                 src/fx_companion_concurrent_cache_probe.zig \
-                src/fx_companion_cancellation_probe.zig
+                src/fx_companion_cancellation_probe.zig \
+                src/fx_companion_profile_output_probe.zig
 
       - name: Build (ReleaseFast)
         run: cd fx-src && zig build -Doptimize=ReleaseFast

@@ -648,6 +648,7 @@ extern "c" fn opendir(path: [*]const u8) ?*anyopaque;
 extern "c" fn readdir(dirp: *anyopaque) ?[*]u8;
 extern "c" fn closedir(dirp: *anyopaque) c_int;
 extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+extern "c" fn usleep(microseconds: c_uint) c_int;
 
 const Timespec = extern struct { sec: isize, nsec: isize };
 fn nowNs() u64 {
@@ -739,6 +740,143 @@ const BenchmarkPair = struct {
     walk: WalkObservation,
 };
 
+const interactive_probe_cap: usize = 10_000;
+const interactive_probe_budget_ms: usize = 100;
+const interactive_full_profile_max_ns: u64 = 10_000_000;
+
+const ProbeStatus = enum {
+    complete,
+    incomplete,
+    timed_out,
+    failed,
+};
+
+const InteractiveProbe = struct {
+    status: ProbeStatus,
+    elapsed_ns: u64,
+    files: usize = 0,
+    overlong: usize = 0,
+    failure: ?anyerror = null,
+    walk: WalkObservation = .{ .directories = 0, .getdirentries_calls = 0, .dirent_bytes = 0, .entries_seen = 0 },
+};
+
+const ProbeDeadline = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    stop: std.atomic.Value(bool) = .init(false),
+};
+
+fn probeDeadlineMain(deadline: *ProbeDeadline) void {
+    for (0..interactive_probe_budget_ms) |_| {
+        if (deadline.done.load(.acquire)) return;
+        _ = usleep(1000);
+    }
+    if (!deadline.done.load(.acquire)) deadline.stop.store(true, .seq_cst);
+}
+
+fn interactiveProbe(workspace_root: []const u8) InteractiveProbe {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena_state.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    var overlong: usize = 0;
+    var exact = false;
+    var deadline = ProbeDeadline{};
+    const timer = std.Thread.spawn(.{}, probeDeadlineMain, .{&deadline}) catch return .{
+        .status = .failed,
+        .elapsed_ns = 0,
+        .failure = error.CompanionUnavailable,
+    };
+
+    const started = nowNs();
+    const incomplete = walkPaths(
+        arena_state.allocator(),
+        workspace_root,
+        &.{ ".git", ".zig-cache", "zig-out", "node_modules", ".next", "dist", "build", "coverage" },
+        null,
+        true,
+        false,
+        interactive_probe_cap,
+        4096,
+        &deadline.stop,
+        &paths,
+        &overlong,
+        &exact,
+        false,
+    ) catch |err| {
+        deadline.done.store(true, .release);
+        timer.join();
+        return .{
+            .status = if (err == error.Canceled and deadline.stop.load(.seq_cst)) .timed_out else .failed,
+            .elapsed_ns = nowNs() - started,
+            .failure = err,
+        };
+    };
+    deadline.done.store(true, .release);
+    timer.join();
+    return .{
+        .status = if (incomplete) .incomplete else .complete,
+        .elapsed_ns = nowNs() - started,
+        .files = paths.items.len,
+        .overlong = overlong,
+        .walk = lastWalkObservation(),
+    };
+}
+
+fn writeResponsiveProfile(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    probe: InteractiveProbe,
+    out: *std.ArrayListUnmanaged(u8),
+) !void {
+    var aw: std.Io.Writer.Allocating = .fromArrayList(arena, out);
+    const w = &aw.writer;
+    try w.writeAll("fx-companion profile\n\n");
+    try w.print("  tree          {s}\n", .{workspace_root});
+    try w.print("  method        responsive bounded probe ({d} paths or {d} ms)\n", .{
+        interactive_probe_cap,
+        interactive_probe_budget_ms,
+    });
+    var b: [4][48]u8 = undefined;
+    switch (probe.status) {
+        .incomplete => {
+            try w.print("  result        path bound reached; full in-session profile skipped\n", .{});
+            try w.print("  bounded cold  {s} single sample · paths={d} incomplete=true\n", .{
+                fmtDur(probe.elapsed_ns, &b[0]),
+                probe.files,
+            });
+            try w.writeAll("  correctness   no stock equivalence or speedup claimed for the bounded subset\n");
+        },
+        .timed_out => {
+            try w.print("  result        {d} ms responsiveness budget reached; full profile skipped\n", .{interactive_probe_budget_ms});
+            try w.print("  bounded cold  {s} before cancellation\n", .{fmtDur(probe.elapsed_ns, &b[0])});
+            try w.writeAll("  correctness   no partial result or speedup claimed\n");
+        },
+        .failed => {
+            try w.print("  result        accelerator probe stopped safely: {s}\n", .{@errorName(probe.failure orelse error.CompanionUnavailable)});
+            try w.writeAll("  correctness   no partial result or speedup claimed\n");
+        },
+        .complete => {
+            try w.print("  bounded cold  {s} single sample · paths={d} complete=true\n", .{
+                fmtDur(probe.elapsed_ns, &b[0]),
+                probe.files,
+            });
+            try w.writeAll("  result        full snapshot profile skipped by the responsiveness guard\n");
+            try w.writeAll("  correctness   cold result complete; no warm speedup claimed\n");
+        },
+    }
+    if (probe.walk.getdirentries_calls > 0) {
+        try w.print("  cold syscalls getdirentries={d} dirent_bytes={d} dirs={d} entries={d}\n", .{
+            probe.walk.getdirentries_calls,
+            probe.walk.dirent_bytes,
+            probe.walk.directories,
+            probe.walk.entries_seen,
+        });
+    }
+    try w.writeAll("\n  The interactive guard keeps the terminal responsive; use the repository benchmark runner for full seven-round results.\n");
+    try w.writeAll("  Network/model timing is not synthesized: no paid request is made.\n");
+    try w.writeAll("  FX_COMPANION_NO_CACHE=1 disables snapshots; FX_NO_COMPANION=1 disables all acceleration.\n");
+    out.* = aw.toArrayList();
+}
+
 fn benchmarkPair(workspace_root: []const u8) !BenchmarkPair {
     clearSnapshotCache();
     var cold_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -815,13 +953,19 @@ pub fn runBenchmark(
     workspace_root: []const u8,
     out: *std.ArrayListUnmanaged(u8),
 ) !void {
+    const preflight = interactiveProbe(workspace_root);
+    const no_cache = std.c.getenv("FX_COMPANION_NO_CACHE");
+    if (preflight.status != .complete or preflight.elapsed_ns > interactive_full_profile_max_ns or
+        (no_cache != null and no_cache.?[0] != 0))
+    {
+        return writeResponsiveProfile(arena, workspace_root, preflight, out);
+    }
+
+    _ = benchmarkPair(workspace_root) catch {
+        return writeResponsiveProfile(arena, workspace_root, preflight, out);
+    };
     var aw: std.Io.Writer.Allocating = .fromArrayList(arena, out);
     const w = &aw.writer;
-    _ = benchmarkPair(workspace_root) catch |err| {
-        try w.print("profile unavailable: {s}\n", .{@errorName(err)});
-        out.* = aw.toArrayList();
-        return;
-    };
 
     const rounds: usize = 7;
     var cold_times: [rounds]u64 = undefined;
