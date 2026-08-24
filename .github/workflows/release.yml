@@ -16,9 +16,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+        run: |
+          # Try ziglang.org first, fall back to Homebrew.
+          URL="https://ziglang.org/download/0.16.0/zig-macos-aarch64-0.16.0.tar.xz"
+          if curl -fsSL "$URL" -o /tmp/zig.tar.xz 2>/dev/null; then
+            mkdir -p /usr/local/opt/zig
+            tar -xJf /tmp/zig.tar.xz -C /usr/local/opt/zig --strip-components=1
+            echo "/usr/local/opt/zig" >> "$GITHUB_PATH"
+          else
+            brew install zig
+          fi
+          zig version
 
       - name: Pin upstream fx
         id: pin
