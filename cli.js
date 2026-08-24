@@ -141,36 +141,39 @@ async function install() {
 }
 
 function activateOnPath() {
-  // Prefer linking into a directory that's already on PATH.
-  const seen = new Set();
-  const pathDirs = ['/opt/homebrew/bin', '/usr/local/bin', ...(process.env.PATH || '').split(':')];
-  for (const d of pathDirs) {
-    if (!d || seen.has(d)) continue;
-    seen.add(d);
+  const ours = path.join(INSTALL_DIR, 'fx');
+  const candidates = [
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    ...(process.env.PATH || '')
+      .split(':')
+      .filter((d) => d && /(\.local\/bin|\.cargo\/bin)$/.test(d)),
+  ];
+  for (const d of candidates) {
     try {
       if (!fs.existsSync(d)) continue;
       const st = fs.statSync(d);
       if (!st.isDirectory()) continue;
       fs.accessSync(d, fs.constants.W_OK);
       const link = path.join(d, 'fx');
-      if (fs.existsSync(link)) {
-        // Existing link/file: only replace symlinks pointing elsewhere that we can verify are ours or dead.
-        const st2 = fs.lstatSync(link);
-        if (st2.isSymbolicLink()) {
-          let target = '';
-          try { target = fs.readlinkSync(link); } catch {}
-          const resolved = path.resolve(path.dirname(link), target);
+      if (fs.existsSync(link) || fs.lstatSync(link, { throwIfNoEntry: false })) {
+        const lst = fs.lstatSync(link);
+        if (lst.isSymbolicLink()) {
+          const resolved = fs.realpathSync(link);
+          if (resolved === ours) {
+            console.log(`✓ ${link} → boosted fx (already active)`);
+            return;
+          }
           if (!fs.existsSync(resolved)) {
-            // dangling symlink — safe to replace
-            fs.rmSync(link);
+            fs.rmSync(link); // dangling
           } else {
-            continue; // something valid owns it; retireOld handled known stock paths
+            continue; // owned by something else
           }
         } else {
-          continue;
+          continue; // real file; retireOld handled known stock paths
         }
       }
-      fs.symlinkSync(path.join(INSTALL_DIR, 'fx'), link);
+      fs.symlinkSync(ours, link);
       console.log(`✓ linked ${link} → boosted fx (already on your PATH)`);
       return;
     } catch {}
