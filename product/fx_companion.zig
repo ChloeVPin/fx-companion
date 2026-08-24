@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const io_mod = @import("../shared/io.zig");
 
 pub const Error = error{
     CompanionUnavailable,
@@ -643,6 +644,10 @@ pub fn boostedBadge(buf: []u8) []const u8 {
 }
 
 // ---------------------------------------------------------------- benchmark
+
+pub fn executablePathAlloc(alloc: std.mem.Allocator) ![]u8 {
+    return std.process.executablePathAlloc(io_mod.getIo(), alloc);
+}
 
 extern "c" fn opendir(path: [*]const u8) ?*anyopaque;
 extern "c" fn readdir(dirp: *anyopaque) ?[*]u8;

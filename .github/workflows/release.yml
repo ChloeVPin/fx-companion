@@ -112,6 +112,18 @@ jobs:
       - name: Build (ReleaseFast)
         run: cd fx-src && zig build -Doptimize=ReleaseFast
 
+      - name: Side-by-side benchmark gate
+        run: |
+          BENCH_TREE=$(mktemp -d /tmp/fxc-benchmark.XXXXXX)
+          trap 'rm -rf -- "$BENCH_TREE"' EXIT
+          /tmp/make-anchor "$BENCH_TREE/tree" 1024 100
+          fx-src/zig-out/bin/fx --fx-companion-benchmark "$BENCH_TREE/tree" 2>&1 | tee /tmp/fxc-benchmark.txt
+          grep -q 'correctness: PASS' /tmp/fxc-benchmark.txt
+          if grep -q 'boosted LOST' /tmp/fxc-benchmark.txt; then
+            echo 'boosted implementation lost the median comparison' >&2
+            exit 1
+          fi
+
       - name: Package
         run: |
           cp fx-src/zig-out/bin/fx fx

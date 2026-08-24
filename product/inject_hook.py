@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 MODULE_SRC = Path(__file__).parent / "fx_companion.zig"
+BENCHMARK_SRC = Path(__file__).parent / "benchmark_runner.zig"
 
 FAST_PATH = '''    try checkCanceled(stop_requested);
 
@@ -137,6 +138,32 @@ def main() -> int:
     text = ws.read_text()
     changed = False
 
+    # The benchmark is a hidden child-process entry point in the built fx
+    # executable. /benchmark hands the terminal to this child so progress is
+    # visible and the interactive renderer is never left looking frozen.
+    benchmark_dst = src / "src" / "fx_companion_benchmark.zig"
+    if not benchmark_dst.exists() or benchmark_dst.read_bytes() != BENCHMARK_SRC.read_bytes():
+        shutil.copyfile(BENCHMARK_SRC, benchmark_dst)
+        print("inject: benchmark runner refreshed")
+
+    main_zig = src / "src" / "main.zig"
+    main_text = main_zig.read_text()
+    benchmark_import = 'const fx_companion_benchmark = @import("fx_companion_benchmark.zig");\n'
+    if benchmark_import not in main_text:
+        main_text = main_text.replace(
+            'const io_mod = @import("core/shared/io.zig");\n',
+            'const io_mod = @import("core/shared/io.zig");\n' + benchmark_import,
+            1,
+        )
+    benchmark_anchor = '''    const raw_env: RawEnviron = @ptrCast(c_envp);\n\n'''
+    benchmark_hook = '''    const raw_env: RawEnviron = @ptrCast(c_envp);\n\n    // fx-companion: isolated, visible stock-vs-boosted benchmark child.\n    if (raw_args.len == 3 and std.mem.eql(u8, std.mem.sliceTo(raw_args[1], 0), "--fx-companion-benchmark")) {\n        io_mod.setRawEnviron(raw_env);\n        const process_args = argsFromRaw(raw_args);\n        var threaded = std.Io.Threaded.init(processAllocator(), .{\n            .argv0 = .init(process_args),\n            .environ = .{ .block = environBlockFromRaw(raw_env) },\n        });\n        defer threaded.deinit();\n        io_mod.setIo(threaded.io());\n        try fx_companion_benchmark.run(std.mem.sliceTo(raw_args[2], 0));\n        return;\n    }\n\n'''
+    if "--fx-companion-benchmark" not in main_text:
+        if benchmark_anchor not in main_text:
+            print("inject: anchor not found (benchmark child entry)", file=sys.stderr)
+            return 1
+        main_text = main_text.replace(benchmark_anchor, benchmark_hook, 1)
+    main_zig.write_text(main_text)
+
     # --- workspace_files.zig: fast walk ---
     if "fx_companion.zig" not in text:
         # drop the module in next to workspace_files.zig
@@ -263,19 +290,22 @@ def main() -> int:
         }'''
             new_unknown = '''        fn commandUnknown(ctx: *anyopaque, cmd_raw: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            // fx-companion: /benchmark is ours — raw speed tests, no model call.
+            // fx-companion: /benchmark runs in an isolated fx child with the
+            // terminal attached, so each round is visible as it completes.
             if (std.mem.startsWith(u8, cmd_raw, "/benchmark")) {
+                const executable = try fx_companion.executablePathAlloc(app.alloc);
+                defer app.alloc.free(executable);
+                try app.runExternalInteractive(&.{ executable, "--fx-companion-benchmark", app.workspace_root });
+                return;
+            }
+            if (std.mem.startsWith(u8, cmd_raw, "/profile")) {
                 var body: std.ArrayListUnmanaged(u8) = .empty;
                 fx_companion.runBenchmark(app.alloc, app.workspace_root, &body) catch |err| {
                     body.deinit(app.alloc);
-                    try app.writeDomainNotice(.{
-                        .topic = "benchmark",
-                        .tone = .@"error",
-                        .body = try std.fmt.allocPrint(app.alloc, "benchmark failed: {s}", .{@errorName(err)}),
-                    }, true);
+                    try app.writeDomainNotice(.{ .topic = "profile", .tone = .@"error", .body = try std.fmt.allocPrint(app.alloc, "profile failed: {s}", .{@errorName(err)}) }, true);
                     return;
                 };
-                try app.writeDomainNotice(.{ .topic = "benchmark", .tone = .neutral, .body = body.items }, true);
+                try app.writeDomainNotice(.{ .topic = "profile", .tone = .neutral, .body = body.items }, true);
                 return;
             }
             try app.writeDomainNotice(.{
@@ -313,7 +343,7 @@ def main() -> int:
     specs = src / "src" / "builtins" / "commands.zig"
     cs = src / "src" / "core" / "slash_commands" / "command_specs.zig"
     anchor_spec = '''    .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },'''
-    new_spec = '''    .{ .kind = .benchmark, .command = "/benchmark", .help_entry = "/benchmark", .completion_description = "fx-companion: run raw speed tests", .presentation_category = .general },'''
+    new_spec = '''    .{ .kind = .benchmark, .command = "/benchmark", .help_entry = "/benchmark", .completion_description = "fx-companion: compare boosted vs stock", .presentation_category = .general },'''
     if not specs.exists():
         problems.append("benchmark registry: builtins/commands.zig missing")
     elif not cs.exists():

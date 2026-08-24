@@ -80,6 +80,43 @@ lanes × 10,000 iterations) and 1,000 mid-walk cancellations without a
 mismatch or deadlock. The public release gate repeats smaller versions of both
 soaks in addition to the public-API equivalence matrix.
 
+## In-session side-by-side benchmark (v0.2.4)
+
+`/benchmark` now runs the same fx executable as an isolated terminal-attached
+child. It disables the companion hook for the stock measurement and enables
+it for cold fill plus warm repeat discovery. The measured interval excludes
+child startup and the boosted cold fill. Each of seven rounds alternates which
+implementation runs first, after one untimed warmup pair. Every stock, cold,
+and warm ordered path list and all `workspace_files.Result` metadata are
+compared byte-for-byte before reporting.
+
+Reproduction:
+
+```sh
+zig run benchmarks/make_anchor.zig -lc -OReleaseFast -- /tmp/fxc-benchmark-anchor 1024 100
+fx --fx-companion-benchmark /tmp/fxc-benchmark-anchor
+```
+
+Local Apple M2 ReleaseFast result, 100,000-path cap:
+
+```text
+round  first    stock ms   boosted ms
+1      stock      79.658        1.152
+2      boost      79.416        1.059
+3      stock      80.894        1.090
+4      boost      79.633        0.859
+5      stock      81.152        1.212
+6      boost      86.835        1.136
+7      stock      90.567        1.205
+median            80.894        1.136   71.24x
+best              79.416        0.859
+correctness: PASS — paths=100000, path_bytes=1000000, metadata matched
+```
+
+This is a warm unchanged-tree repeat-discovery result, not a cold traversal
+claim. The public release workflow independently recreates the fixture, runs
+the comparison, requires the equivalence line, and rejects a median loss.
+
 ## Interactive `/benchmark` responsiveness regression
 
 Release v0.2.1 ran the full cache-dependent profile synchronously before it

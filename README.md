@@ -68,12 +68,27 @@ benchmarks/run_discover_bench.sh /tmp/fxanchor-new 7 100000
 benchmarks/run_discover_bench.sh /tmp/fxanchor-new 7 600000
 ```
 
-In any session, `/benchmark` first applies a 10,000-path / 100 ms
-responsiveness guard. Small workspaces get the full seven-round cold/warm
-profile with median and best; larger workspaces get an honest bounded syscall
-profile with no speedup claim instead of blocking the terminal. It makes no
-synthetic or paid model request. Use the runner above for full large-tree
-measurements.
+In any session, `/benchmark` now hands the terminal to an isolated copy of the
+same pinned fx executable and prints a side-by-side comparison as every round
+finishes. The non-boosted column disables the additive hook and executes fx's
+original workspace-discovery path. The boosted column measures unchanged-tree
+repeat discovery after its snapshot fill. Both sides use the same options and
+toolchain, get one untimed warmup, alternate measurement order for seven
+rounds, and report median plus best. Every stock, boosted-cold, and
+boosted-warm result is compared byte-for-byte (ordered paths and result
+metadata) before a result is printed. Child startup and boosted cold-fill time
+are explicitly excluded from the repeat-discovery measurement.
+
+`/profile` retains the bounded syscall/cache diagnostic view. Neither command
+makes a synthetic or paid model request.
+
+The side-by-side benchmark is also a release gate. Reproduce its deterministic
+100,000-path workload with:
+
+```sh
+zig run benchmarks/make_anchor.zig -lc -OReleaseFast -- /tmp/fxc-benchmark 1024 100
+fx --fx-companion-benchmark /tmp/fxc-benchmark
+```
 
 FSEvents-only invalidation was rejected. A synchronous flush took 0.012 ms,
 but an immediate file creation was not visible until 11.741 ms and nine
