@@ -125,3 +125,21 @@ Built on [**fx**](https://github.com/vercel-labs/fx) by **Vercel Labs** · © Ve
 Unofficial project — not affiliated with or endorsed by Vercel. See [NOTICE](NOTICE).
 
 </div>
+
+## Independence policy
+
+fx-companion is fully self-governed. We **read** vercel-labs/fx as pinned
+source; we never open issues or PRs there, never contact the fx team, and
+never modify their repositories. Our relationship to upstream is strictly
+one-way consumption:
+
+- `PINNED_FX` records exactly which upstream commit each release builds from.
+- `product/inject_hook.py` re-applies our additive hooks onto any new
+  upstream version; every hook is independent, so even if an upstream change
+  breaks a cosmetic anchor (badge, benchmark), the core speed booster still
+  applies and only that feature is skipped — loudly, never silently.
+- `FX_NO_COMPANION=1` always returns you to 100% stock behavior.
+
+Updating is on our schedule, tested before it reaches you:
+CI injects against pinned source, runs the equivalence gate, and publishes
+only if boosted output is byte-identical to stock.
