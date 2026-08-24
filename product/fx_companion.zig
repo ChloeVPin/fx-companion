@@ -158,6 +158,14 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+/// Adaptive duration formatting: ns below 1 µs, µs below 1 ms, then ms.
+fn fmtDur(ns: u64, buf: []u8) []const u8 {
+    const f: f64 = @floatFromInt(ns);
+    if (ns < 1_000) return std.fmt.bufPrint(buf, "{d:.0} ns", .{f}) catch "?";
+    if (ns < 1_000_000) return std.fmt.bufPrint(buf, "{d:.1} \u{00b5}s", .{f / 1e3}) catch "?";
+    return std.fmt.bufPrint(buf, "{d:.2} ms", .{f / 1e6}) catch "?";
+}
+
 fn median3(a: u64, b: u64, t3: u64) u64 {
     var lo = @min(a, b);
     _ = &lo;
@@ -279,9 +287,11 @@ pub fn runBenchmark(
         if (comp_count == ref_count) "  ✓ match" else "  ✗ MISMATCH",
     });
     if (incomplete) try w.writeAll("  (walk reported incomplete)\n");
-    try w.print("  stock-equiv   {d:.1} ms  (median of {d})\n", .{ @as(f64, @floatFromInt(ref_med)) / 1e6, rounds });
-    try w.print("  accelerated   {d:.1} ms  (median of {d}, 8 workers)\n", .{ @as(f64, @floatFromInt(comp_med)) / 1e6, rounds });
-    try w.print("  speedup       {d:.2}x\n", .{speedup});
+    var b1: [48]u8 = undefined;
+    var b2: [48]u8 = undefined;
+    try w.print("  stock-equiv   {s}  (median of {d})\n", .{ fmtDur(ref_med, &b1), rounds });
+    try w.print("  accelerated   {s}  (median of {d}, 8 workers)\n", .{ fmtDur(comp_med, &b2), rounds });
+    try w.print("  speedup       {d:.2}x{s}\n", .{ speedup, if (speedup < 1.0) "  (tree too small to benefit)" else "" });
     try w.writeAll("\n  FX_NO_COMPANION=1 disables the fast path.\n");
     out.* = aw.toArrayList();
 }

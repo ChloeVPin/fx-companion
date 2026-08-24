@@ -1,0 +1,19 @@
+{
+  "name": "fx-companion",
+  "version": "0.1.3",
+  "description": "Boosted fx for Apple Silicon - stock output, faster traversal. One-command installer.",
+  "license": "Apache-2.0",
+  "bin": {
+    "fx-companion": "cli.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChloeVPin/fx-companion.git"
+  },
+  "keywords": ["fx", "apple-silicon", "cli", "agent"],
+  "files": ["cli.js"]
+}
