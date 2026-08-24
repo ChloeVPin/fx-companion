@@ -1,18 +1,33 @@
 # fx-companion Plan
 
-**Status:** Experimental / Research Prototype (Revised 2026-08-23)
+**Status:** Shipping product plus retained research archive (Revised 2026-08-24)
 **License:** Apache-2.0
 **Primary Platform:** macOS on Apple Silicon (M-series)
 **Language:** Zig 0.16+ for new code; C only for syscalls Apple does not expose to Zig cleanly.
-**Compatibility pin:** fx `04e0ae0b2076ccabb3c972351f5f0fbf2f67cc93` (main, 2026-08-22). Re-pin before any benchmark run.
+**Compatibility pin:** fx `669ef8a7f0bf6b13a1722bfd434fb9fc61d01511`. `PINNED_FX` is authoritative.
 
 ## 1. Vision
 
-fx-companion is a native user-space companion that sits alongside fx.
-It removes residual deterministic overhead in the agent loop while leaving the fx binary,
-cold-start, and memory footprint completely untouched.
+fx-companion is a source-injected additive acceleration module compiled with pinned fx.
+It preserves fx's observable workspace-discovery contract and falls back to stock whenever
+the accelerated path cannot prove an exact result.
 
 Primary focus is deterministic acceleration. Speculative features are strictly opt-in.
+
+### Shipped path (2026-08-24)
+
+- Cold sorted traversal: eight getdirentries workers, 128 KiB buffers.
+- Warm sorted traversal: packed path snapshot, validated on local APFS by parallel
+  device/inode/mode/mtime/ctime checks for every traversed directory.
+- Exact cap handling: stock computes the first capped result; later calls reuse only a
+  validated byte-identical snapshot. Source-order calls always stay stock.
+- Public-API equivalence gate covers ordering, cap metadata, hidden paths, Git ignores,
+  symlinks, special files, cache hits, create/delete invalidation, and content-only hits.
+- FSEvents-only invalidation rejected: the immediate post-create synchronous flush missed
+  the event; reproducible result is recorded under `benchmarks/results/`.
+
+The older daemon, XPC, ZeroCopyState, AMX, and predictor sections below are retained as
+research history. They are not the installed product path.
 
 ## 2. Goals
 

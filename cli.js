@@ -104,19 +104,27 @@ async function install() {
   const buf = await download(rel.assetUrl, tgz);
 
   process.stdout.write('🔒 verifying checksum…\n');
-  let expected = null;
-  if (rel.sumsUrl) {
-    try {
-      const sum = await (await fetch(rel.sumsUrl, { redirect: 'follow' })).text();
-      for (const line of sum.split('\n')) {
-        const [hash, name] = line.trim().split(/\s+/);
-        if (name === path.basename(rel.assetUrl)) expected = hash;
-      }
-    } catch {}
+  if (!rel.sumsUrl) err(`release ${rel.tag} has no SHA256SUMS; refusing an unverified install`);
+  let sumsResponse;
+  try {
+    sumsResponse = await fetch(rel.sumsUrl, { redirect: 'follow' });
+  } catch (e) {
+    err(`could not download SHA256SUMS (${e.message}); refusing an unverified install`);
   }
+  if (!sumsResponse.ok) {
+    err(`checksum download failed (${sumsResponse.status}); refusing an unverified install`);
+  }
+  const sum = await sumsResponse.text();
+  const assetName = path.basename(rel.assetUrl);
+  let expected = null;
+  for (const line of sum.split('\n')) {
+    const [hash, name] = line.trim().split(/\s+/);
+    if (name === assetName && /^[a-f0-9]{64}$/i.test(hash)) expected = hash.toLowerCase();
+  }
+  if (!expected) err(`SHA256SUMS has no valid entry for ${assetName}`);
   const actual = crypto.createHash('sha256').update(buf).digest('hex');
-  if (expected && expected !== actual) err(`checksum mismatch!\n  expected ${expected}\n  actual   ${actual}`);
-  console.log(expected ? '✓ checksum ok' : '⚠ checksum file unavailable, skipped verification');
+  if (expected !== actual) err(`checksum mismatch!\n  expected ${expected}\n  actual   ${actual}`);
+  console.log('✓ checksum ok');
 
   retireOld();
 

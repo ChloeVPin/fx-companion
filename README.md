@@ -16,38 +16,66 @@
 
 ## Install
 
+```sh
+npx github:ChloeVPin/fx-companion
+```
+
 One command. It downloads a prebuilt binary (checksum verified), retires any
 stock `fx` you already have — your sessions, skills, and settings are never
 touched — and links it onto your PATH.
 
-Before installing anything, the installer runs an equivalence test: boosted
-output must be byte-identical to stock on a known tree. If it isn't, nothing
-is installed.
+Every published binary passes the stock-vs-boosted equivalence gate in public
+CI. The installer verifies the release checksum and booster marker before it
+replaces anything.
 
 **Requirements:** macOS on Apple Silicon, Node 18+.
 
 ## What it does
 
-fx walks your workspace on every turn of its agent loop — single threaded,
-2 KB buffer, one directory at a time. fx-companion replaces that inner loop
-with an eight-worker pool over the same syscalls and 128 KB buffers.
-Everything else is stock fx, unchanged.
+fx walks your workspace throughout the agent loop — single threaded, 2 KB
+buffer, one directory at a time. fx-companion replaces sorted walks with an
+eight-worker pool and 128 KB buffers, then retains the packed sorted result.
+Repeat walks validate every traversed directory in parallel and materialize
+the snapshot without rereading the tree. Content edits stay warm; path changes
+invalidate it.
+
+Source-order walks stay stock. If the 100,000-entry cap truncates a tree, the
+first call uses stock's exact first-N result and snapshots that result for
+later calls. It never substitutes a different parallel subset.
 
 The booster is purely additive: unsupported platform, any hard failure, or
 `FX_NO_COMPANION=1` falls back to the stock walk automatically.
+`FX_COMPANION_NO_CACHE=1` keeps the parallel cold path but disables snapshots.
 
 ## Performance
 
-Measured on macOS arm64, ReleaseFast, medians of timed runs after warmup.
-Reproduce with [`product/tests_fxcompanion.zig`](product/tests_fxcompanion.zig).
+Apple M2, macOS 27 arm64, ReleaseFast. One untimed pair, seven timed pairs,
+alternating order, fresh arenas, byte comparison every round. Medians below;
+best times and every raw round are in the [benchmark record](benchmarks/results/2026-08-24-apple-silicon.md).
 
-| Surface | Stock | Boosted | Speedup |
-|---|---:|---:|---:|
-| Workspace walk, end to end (409,600 files) | 1,589–1,685 ms | 347–533 ms | **3.2–4.6×** |
-| Raw traversal | 213 ms | 104 ms | **2.05×** |
+| Tree / cap | Stock | Cold | Warm | Warm speedup |
+|---|---:|---:|---:|---:|
+| 409,600 files / 100,000 | 80.251 ms | 441.038 ms | 5.100 ms | **15.737×** |
+| 409,600 files / 600,000 | 497.828 ms | 222.844 ms | 5.511 ms | **90.332×** |
+| 8 files / 100,000 | 0.158 ms | 0.441 ms | 0.221 ms | **0.713×** |
 
-In any session, `/benchmark` runs raw speed tests on your current workspace:
-stock-equivalent vs accelerated walk, seven rounds each, median and best.
+The exact capped cold path loses and breaks even on the sixth unchanged
+name-set walk in this corpus. Tiny trees lose by 0.063 ms warm.
+
+```sh
+zig run benchmarks/make_anchor.zig -lc -OReleaseFast -- /tmp/fxanchor-new 4096 100
+benchmarks/run_discover_bench.sh /tmp/fxanchor-new 7 100000
+benchmarks/run_discover_bench.sh /tmp/fxanchor-new 7 600000
+```
+
+In any session, `/benchmark` reports cold traversal, warm validation and
+materialization, directory-read syscalls and bytes, retained cache memory,
+median, and best. It makes no synthetic or paid model request.
+
+FSEvents-only invalidation was rejected. A synchronous flush took 0.012 ms,
+but an immediate file creation was not visible until 11.741 ms and nine
+flush/poll attempts. The reproducible failed experiment is in the
+[benchmark record](benchmarks/results/2026-08-24-apple-silicon.md#rejected-fsevents-only-invalidation).
 
 ## Updating
 
@@ -72,8 +100,8 @@ hook, only that feature is skipped, loudly, and the speed booster still works.
 <details>
 <summary><b>Is this a fork?</b></summary>
 
-No. Each release builds vercel-labs/fx unmodified plus one additive module
-with a graceful fallback. Remove the module and you have exactly stock fx.
+No. Each release builds pinned vercel-labs/fx with one additive module and
+small generated hooks. The stock path remains in place as the fallback.
 </details>
 
 <details>

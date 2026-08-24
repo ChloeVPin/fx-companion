@@ -1,188 +1,240 @@
-// Equivalence probe: stock single-threaded walk vs fx-companion parallel
-// walk, same tree, byte-for-byte comparison of the sorted relative path
-// list. Exercises both targets and the ignored_paths set.
+//! Public-API equivalence gate for fx-companion.
+//!
+//! This file is copied to `src/tests_fxcompanion.zig` after injection. Each
+//! case runs the real pinned fx workspace walker twice in one process: first
+//! with the companion disabled, then with it enabled. The comparison includes
+//! path bytes, path order, source, truncation metadata, and overlong counts.
 const std = @import("std");
-const companion = @import("../src/core/workspace/fx_companion.zig");
+const companion = @import("core/workspace/fx_companion.zig");
+const workspace_files = @import("core/workspace/workspace_files.zig");
 
 extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+extern "c" fn alarm(seconds: c_uint) c_uint;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
+extern "c" fn truncate(path: [*:0]const u8, length: i64) c_int;
+extern "c" fn __error() *c_int;
+
 const Timespec = extern struct { sec: isize, nsec: isize };
+
 fn nowNs() u64 {
     var ts: Timespec = undefined;
     _ = clock_gettime(4, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
-fn sortPaths(paths: [][]const u8) void {
-    std.mem.sort([]const u8, paths, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
+fn comparePaths(label: []const u8, stock: []const []const u8, boosted: []const []const u8) !void {
+    if (stock.len != boosted.len) {
+        std.debug.print("[{s}] MISMATCH count stock={d} boosted={d}\n", .{ label, stock.len, boosted.len });
+        return error.CountMismatch;
+    }
+    for (stock, boosted, 0..) |stock_path, boosted_path, index| {
+        if (!std.mem.eql(u8, stock_path, boosted_path)) {
+            std.debug.print("[{s}] MISMATCH index={d} stock='{s}' boosted='{s}'\n", .{
+                label,
+                index,
+                stock_path,
+                boosted_path,
+            });
+            return error.ContentMismatch;
         }
-    }.lt);
+    }
 }
 
-// Reference: single-threaded getdirentries DFS with a 2 KB buffer. This is
-// syscall-for-syscall what stock std.Io.Dir.Iterator performs (readdir is a
-// thin wrapper over getdirentries), so agreement here means agreement with
-// stock fx's walk output.
-extern "c" fn opendir(path: [*]const u8) ?*anyopaque;
-extern "c" fn readdir(dirp: *anyopaque) ?[*]u8;
-extern "c" fn closedir(dirp: *anyopaque) c_int;
-fn stockWalk(
-    arena: std.mem.Allocator,
+fn compareFiles(
     root: []const u8,
-    ignored_names: []const []const u8,
-    target_files: bool,
-    cap: usize,
-    out: *std.ArrayList([]const u8),
-) !bool { // returns incomplete
-    var stack: std.ArrayList([]const u8) = .empty; // NUL-terminated prefixes
-    try stack.append(arena, try arena.dupeZ(u8, ""));
-    var incomplete = false;
-    var overlong: usize = 0;
+    options: workspace_files.Options,
+    label: []const u8,
+) !companion.CacheObservation {
+    var stock_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer stock_arena.deinit();
+    workspace_files.companion_enabled = false;
+    const stock_started = nowNs();
+    const stock = try workspace_files.discover(stock_arena.allocator(), root, options);
+    const stock_ns = nowNs() - stock_started;
+
+    var boosted_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer boosted_arena.deinit();
+    workspace_files.companion_enabled = true;
+    const boosted_started = nowNs();
+    const boosted = try workspace_files.discover(boosted_arena.allocator(), root, options);
+    const boosted_ns = nowNs() - boosted_started;
+
+    if (stock.source != boosted.source or
+        stock.candidate_cap != boosted.candidate_cap or
+        stock.incomplete != boosted.incomplete or
+        stock.cap_reason != boosted.cap_reason or
+        stock.skipped_overlong != boosted.skipped_overlong)
+    {
+        std.debug.print(
+            "[{s}] MISMATCH metadata stock=(source={s}, cap={d}, incomplete={}, reason={any}, overlong={d}) boosted=(source={s}, cap={d}, incomplete={}, reason={any}, overlong={d})\n",
+            .{
+                label,
+                @tagName(stock.source),
+                stock.candidate_cap,
+                stock.incomplete,
+                stock.cap_reason,
+                stock.skipped_overlong,
+                @tagName(boosted.source),
+                boosted.candidate_cap,
+                boosted.incomplete,
+                boosted.cap_reason,
+                boosted.skipped_overlong,
+            },
+        );
+        return error.MetadataMismatch;
+    }
+    try comparePaths(label, stock.files, boosted.files);
+    std.debug.print("[{s}] IDENTICAL paths={d} stock={d}us boosted={d}us\n", .{
+        label,
+        stock.files.len,
+        stock_ns / 1000,
+        boosted_ns / 1000,
+    });
+    return companion.lastCacheObservation();
+}
+
+fn verifyCacheInvalidation(root: []const u8, cap: usize) !void {
+    const options: workspace_files.Options = .{
+        .candidate_cap = cap,
+        .force_fallback = true,
+        .sort_paths = true,
+    };
+    companion.clearSnapshotCache();
+    const cold = try compareFiles(root, options, "cache/cold");
+    if (cold.hit) return error.UnexpectedColdCacheHit;
+    const warm = try compareFiles(root, options, "cache/warm");
+    if (!warm.hit) return error.MissingWarmCacheHit;
+
+    var mutation_buf: [1024]u8 = undefined;
+    const mutation_path = try std.fmt.bufPrintZ(&mutation_buf, "{s}/.fxc-cache-equivalence", .{root});
+    const O_WRONLY: c_int = 0x0001;
+    const O_CREAT: c_int = 0x0200;
+    const O_EXCL: c_int = 0x0800;
+    const fd = open(mutation_path.ptr, O_WRONLY | O_CREAT | O_EXCL, @as(c_uint, 0o600));
+    if (fd < 0) return error.CreateMutationFailed;
+    _ = close(fd);
+    var mutation_exists = true;
     defer {
-        for (stack.items) |item| arena.free(item);
-        stack.deinit(arena);
+        if (mutation_exists) _ = unlink(mutation_path.ptr);
     }
-    const dp0 = opendir(root.ptr) orelse return error.OpenFailed;
-    _ = closedir(dp0);
 
-    while (stack.pop()) |prefix| {
-        if (incomplete) break;
-        var pathbuf: [4096]u8 = undefined;
-        if (prefix.len == 0) {
-            @memcpy(pathbuf[0..root.len], root);
-            pathbuf[root.len] = 0;
-        } else {
-            @memcpy(pathbuf[0..root.len], root);
-            pathbuf[root.len] = '/';
-            @memcpy(pathbuf[root.len + 1 ..][0..prefix.len], prefix);
-            pathbuf[root.len + 1 + prefix.len] = 0;
-        }
-
-        const dp = opendir(&pathbuf) orelse continue;
-        defer _ = closedir(dp);
-        while (true) {
-            const dent = readdir(dp) orelse break;
-            // readdir is the 64-bit-inode variant on modern Darwin:
-            // d_ino u64 @0, d_seekoff u64 @8, d_reclen u16 @16,
-            // d_namlen u16 @18, d_type u8 @20, name @21. (The getdirentries
-            // buffer uses the legacy 32-bit-ino layout; they differ!)
-            const reclen = std.mem.readInt(u16, dent[16..18], .little);
-            if (reclen == 0) break;
-            const namlen: usize = std.mem.readInt(u16, dent[18..20], .little);
-            const dtype = dent[20];
-            const name = dent[21 .. 21 + namlen];
-            const dot = name.len == 1 and name[0] == '.';
-            const dotdot = name.len == 2 and name[0] == '.' and name[1] == '.';
-            if (dot or dotdot) continue;
-            if (dtype != 4) { // file or symlink: stock has NO hidden filter
-                if (!target_files) continue;
-                if (isIgnoredList(ignored_names, name)) continue;
-                if (out.items.len >= cap) {
-                    incomplete = true;
-                    return incomplete;
-                }
-                const rel_len = if (prefix.len == 0) name.len else prefix.len + 1 + name.len;
-                if (rel_len > 2048) {
-                    overlong += 1;
-                    continue;
-                }
-                const rel = if (prefix.len == 0)
-                    try arena.dupe(u8, name)
-                else
-                    try std.fmt.allocPrint(arena, "{s}/{s}", .{ prefix, name });
-                try out.append(arena, rel);
-                continue;
-            }
-            // directory: hidden filter (unless include_hidden), ignore list,
-            // then recurse. Same order as workspace_files.zig.
-            if (!include_hidden and isHiddenName(name)) continue;
-            if (isIgnoredList(ignored_names, name)) continue;
-            const child = if (prefix.len == 0)
-                try arena.dupeZ(u8, name)
-            else
-                try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ prefix, name }, 0);
-            if (!target_files) try out.append(arena, child);
-            try stack.append(arena, child);
-        }
+    const after_create = try compareFiles(root, options, "cache/after-create");
+    if (after_create.hit) return error.StaleCacheAfterCreate;
+    if (truncate(mutation_path.ptr, 1) != 0) {
+        std.debug.print("cache content mutation failed errno={d} path={s}\n", .{ __error().*, mutation_path });
+        return error.WriteMutationFailed;
     }
-    return incomplete;
+    const after_content_write = try compareFiles(root, options, "cache/after-content-write");
+    if (!after_content_write.hit) return error.CacheMissAfterContentOnlyWrite;
+    if (unlink(mutation_path.ptr) != 0) return error.DeleteMutationFailed;
+    mutation_exists = false;
+    const after_delete = try compareFiles(root, options, "cache/after-delete");
+    if (after_delete.hit) return error.StaleCacheAfterDelete;
 }
 
-fn isHiddenName(name: []const u8) bool {
-    return name.len > 1 and name[0] == '.';
-}
+fn compareDirectories(root: []const u8, options: workspace_files.Options, label: []const u8) !void {
+    var stop_requested: std.atomic.Value(bool) = .init(false);
 
-var include_hidden = false;
+    var stock_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer stock_arena.deinit();
+    workspace_files.companion_enabled = false;
+    const stock_started = nowNs();
+    const stock = try workspace_files.discoverDirectoriesCancellable(
+        stock_arena.allocator(),
+        root,
+        options,
+        &stop_requested,
+    );
+    const stock_ns = nowNs() - stock_started;
 
-fn isIgnoredList(list: []const []const u8, name: []const u8) bool {
-    for (list) |e| if (std.mem.eql(u8, e, name)) return true;
-    return false;
+    var boosted_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer boosted_arena.deinit();
+    workspace_files.companion_enabled = true;
+    const boosted_started = nowNs();
+    const boosted = try workspace_files.discoverDirectoriesCancellable(
+        boosted_arena.allocator(),
+        root,
+        options,
+        &stop_requested,
+    );
+    const boosted_ns = nowNs() - boosted_started;
+
+    if (stock.source != boosted.source or
+        stock.candidate_cap != boosted.candidate_cap or
+        stock.incomplete != boosted.incomplete or
+        stock.cap_reason != boosted.cap_reason or
+        stock.skipped_overlong != boosted.skipped_overlong)
+    {
+        std.debug.print("[{s}] MISMATCH directory metadata\n", .{label});
+        return error.MetadataMismatch;
+    }
+    try comparePaths(label, stock.directories, boosted.directories);
+    std.debug.print("[{s}] IDENTICAL paths={d} stock={d}us boosted={d}us\n", .{
+        label,
+        stock.directories.len,
+        stock_ns / 1000,
+        boosted_ns / 1000,
+    });
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    // A regressed worker-pool wakeup must fail CI promptly, not consume the
+    // workflow's full timeout.
+    _ = alarm(60);
+    defer _ = alarm(0);
+
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     const root = args.next() orelse return error.MissingRoot;
-    const cap_arg: usize = if (args.next()) |a| std.fmt.parseInt(usize, a, 10) catch 100_000 else 100_000;
+    const cap = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else 100_000;
+    const mutation_check = if (args.next()) |raw| std.mem.eql(u8, raw, "--mutation-check") else false;
 
-    var gpa_state = std.heap.DebugAllocator(.{}){};
-    const gpa = gpa_state.allocator();
+    if (!companion.active()) return error.CompanionInactive;
+    defer workspace_files.companion_enabled = true;
 
-    inline for (.{ true, false }) |target_files| {
-        const ignored_names_default = [_][]const u8{
-            ".git", ".zig-cache", "zig-out", "node_modules", ".next", "dist", "build", "coverage",
-        };
-        const cap: usize = cap_arg;
-        // --- stock ---
-        var arena_stock = std.heap.ArenaAllocator.init(gpa);
-        defer arena_stock.deinit();
-        var stock_list: std.ArrayList([]const u8) = .empty;
-        const t0 = nowNs();
-        const inc_s = try stockWalk(arena_stock.allocator(), root, &ignored_names_default, target_files, cap, &stock_list);
-        const t_stock = nowNs() - t0;
-        sortPaths(stock_list.items);
+    _ = try compareFiles(root, .{
+        .candidate_cap = cap,
+        .force_fallback = true,
+        .sort_paths = true,
+    }, "files/sorted");
+    _ = try compareFiles(root, .{
+        .candidate_cap = cap,
+        .force_fallback = true,
+        .sort_paths = false,
+    }, "files/source-order");
+    _ = try compareFiles(root, .{
+        .candidate_cap = cap,
+        .force_fallback = true,
+        .include_hidden = true,
+        .sort_paths = true,
+    }, "files/hidden");
+    _ = try compareFiles(root, .{
+        .candidate_cap = 0,
+        .force_fallback = true,
+        .sort_paths = true,
+    }, "files/zero-cap");
 
-        // --- companion ---
-        var arena_c = std.heap.ArenaAllocator.init(gpa);
-        defer arena_c.deinit();
-        var comp_list: std.ArrayList([]const u8) = .empty;
-        var overlong: usize = 0;
-        const t1 = nowNs();
-        const incomplete = try companion.walkPaths(
-            arena_c.allocator(),
-            root,
-            &ignored_names_default,
-            null,
-            target_files,
-            false,
-            cap,
-            2048,
-            null,
-            &comp_list,
-            &overlong,
-        );
-        const t_comp = nowNs() - t1;
-        sortPaths(comp_list.items);
+    try compareDirectories(root, .{
+        .candidate_cap = cap,
+        .force_fallback = true,
+        .sort_paths = true,
+    }, "dirs/sorted");
+    try compareDirectories(root, .{
+        .candidate_cap = cap,
+        .force_fallback = true,
+        .sort_paths = false,
+    }, "dirs/source-order");
+    // On a Git worktree this exercises fx's ignored-path set. Elsewhere it
+    // still compares the public fallback behavior.
+    try compareDirectories(root, .{
+        .candidate_cap = cap,
+        .sort_paths = true,
+    }, "dirs/git-aware");
 
-        const label = if (target_files) "files" else "dirs";
-        std.debug.print("[{s}] stock={d} entries {d}us inc={}| companion={d} entries {d}us incomplete={}\n", .{
-            label, stock_list.items.len, t_stock / 1000, inc_s, comp_list.items.len, t_comp / 1000, incomplete,
-        });
+    if (mutation_check) try verifyCacheInvalidation(root, cap);
 
-        if (stock_list.items.len != comp_list.items.len) {
-            std.debug.print("MISMATCH counts: stock:\n", .{});
-            for (stock_list.items) |p| std.debug.print("  S '{s}'\n", .{p});
-            std.debug.print("companion:\n", .{});
-            for (comp_list.items) |p| std.debug.print("  C '{s}'\n", .{p});
-            return error.CountMismatch;
-        }
-        for (stock_list.items, comp_list.items, 0..) |a, b, i| {
-            if (!std.mem.eql(u8, a, b)) {
-                std.debug.print("MISMATCH at {d}: stock='{s}' companion='{s}'\n", .{ i, a, b });
-                return error.ContentMismatch;
-            }
-        }
-        std.debug.print("[{s}] IDENTICAL\n", .{label});
-    }
+    const case_count: usize = if (mutation_check) 12 else 7;
+    std.debug.print("EQUIVALENCE_OK cases={d}\n", .{case_count});
 }
