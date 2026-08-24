@@ -30,9 +30,11 @@ done.
 </div>
 
 > [!NOTE]
-> Requires macOS on Apple Silicon and Node 18+. If `~/.local/bin` precedes the
-> npx install dir on your PATH, add this to your `~/.zshrc`:
-> `export PATH="$HOME/.fx-companion/bin:$PATH"`
+> Requires macOS on Apple Silicon and Node 18+.
+>
+> **Every release is built in public CI** from vercel-labs/fx at a pinned
+> commit, and the installer refuses to install anything that doesn't pass a
+> byte-identical output self-test. No trust required — reproduce it yourself.
 
 <details>
 <summary><b>Commands</b></summary>

@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Pin upstream fx
+        id: pin
+        run: |
+          COMMIT=$(cat PINNED_FX)
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "building against vercel-labs/fx@$COMMIT"
+
+      - name: Clone upstream fx
+        run: git clone https://github.com/vercel-labs/fx fx-src && git -C fx-src checkout "${{ steps.pin.outputs.commit }}"
+
+      - name: Inject booster
+        run: python3 product/inject_hook.py fx-src
+
+      - name: Equivalence self-test (byte-identical or bust)
+        run: |
+          cp product/tests_fxcompanion.zig fx-src/src/tests_fxcompanion.zig
+          cd fx-src
+          zig build-exe src/tests_fxcompanion.zig -lc -OReleaseFast -femit-bin=/tmp/equiv-probe
+          rm -rf /tmp/fxtiny-ci && mkdir -p /tmp/fxtiny-ci/src/deep /tmp/fxtiny-ci/node_modules/pkg /tmp/fxtiny-ci/.git
+          touch /tmp/fxtiny-ci/a.txt /tmp/fxtiny-ci/b.log /tmp/fxtiny-ci/.dotfile \
+                /tmp/fxtiny-ci/src/main.zig /tmp/fxtiny-ci/src/deep/x.zig \
+                /tmp/fxtiny-ci/node_modules/pkg/index.js
+          ln -sf a.txt /tmp/fxtiny-ci/link_to_a
+          ln -sfn src /tmp/fxtiny-ci/dirlink
+          OUT=$(/tmp/equiv-probe /tmp/fxtiny-ci 2>&1)
+          echo "$OUT"
+          COUNT=$(echo "$OUT" | grep -c IDENTICAL || true)
+          [ "$COUNT" -eq 2 ] || { echo "equivalence FAILED"; exit 1; }
+          rm -f src/tests_fxcompanion.zig
+
+      - name: Build (ReleaseFast)
+        run: cd fx-src && zig build -Doptimize=ReleaseFast
+
+      - name: Package
+        run: |
+          cp fx-src/zig-out/bin/fx fx
+          chmod +x fx
+          TAG="${GITHUB_REF_NAME:-v0.0.0-dev}"
+          tar -czf "fx-boosted-macos-arm64-${TAG}.tar.gz" fx
+          shasum -a 256 "fx-boosted-macos-arm64-${TAG}.tar.gz" > SHA256SUMS
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            "fx-boosted-macos-arm64-${TAG}.tar.gz" SHA256SUMS \
+            -R "$GITHUB_REPOSITORY" \
+            --title "$TAG — boosted fx (auto-built)" \
+            --notes "Built in CI from vercel-labs/fx@$(cat PINNED_FX) with the booster injected. Equivalence self-test passed before packaging." \
+            || gh release upload "$TAG" \
+            "fx-boosted-macos-arm64-${TAG}.tar.gz" SHA256SUMS \
+            -R "$GITHUB_REPOSITORY" --clobber
