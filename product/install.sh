@@ -28,6 +28,13 @@ if [ ! -f "$UPSTREAM/build.zig" ]; then
   git clone --depth 1 https://github.com/vercel-labs/fx "$UPSTREAM"
 fi
 
+# Retire any previously installed stock fx (user data in ~/.fx untouched).
+for old in "$HOME/.local/bin/fx" "$HOME/.fx-companion/bin/fx" "/usr/local/bin/fx"; do
+  if [ -f "$old" ]; then
+    mv "$old" "$old.stock.bak" && echo "install: retired previous $old (backup at $old.stock.bak)"
+  fi
+done
+
 python3 "$HERE/inject_hook.py" "$UPSTREAM"
 
 echo "install: building fx (ReleaseFast) — a few minutes"

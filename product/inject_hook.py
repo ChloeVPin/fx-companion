@@ -135,9 +135,10 @@ def main() -> int:
         return 1
     atext = appc.read_text()
     if "/benchmark" in atext:
-        print("inject: benchmark already present")
-        return 0
-    old_unknown = '''        fn commandUnknown(ctx: *anyopaque, _: []const u8) !void {
+        print("inject: benchmark handler already present")
+        old_unknown = None
+    else:
+        old_unknown = '''        fn commandUnknown(ctx: *anyopaque, _: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.writeDomainNotice(.{
                 .topic = "command",
@@ -145,7 +146,7 @@ def main() -> int:
                 .body = "Unknown command. Try /help.",
             }, true);
         }'''
-    new_unknown = '''        fn commandUnknown(ctx: *anyopaque, cmd_raw: []const u8) !void {
+        new_unknown = '''        fn commandUnknown(ctx: *anyopaque, cmd_raw: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             // fx-companion: /benchmark is ours — raw speed tests, no model call.
             if (std.mem.startsWith(u8, cmd_raw, "/benchmark")) {
@@ -168,21 +169,59 @@ def main() -> int:
                 .body = "Unknown command. Try /help. (Tip: /benchmark runs fx-companion speed tests.)",
             }, true);
         }'''
-    if old_unknown not in atext:
-        print("inject: anchor not found (commandUnknown)", file=sys.stderr)
-        return 1
-    atext = atext.replace(old_unknown, new_unknown, 1)
-    m3 = re.search(r'(const io_mod = @import\("[^"]*shared/io\.zig"\);\n)', atext)
+    if old_unknown is not None:
+        if old_unknown not in atext:
+            print("inject: anchor not found (commandUnknown)", file=sys.stderr)
+            return 1
+        atext = atext.replace(old_unknown, new_unknown, 1)
+        m3 = re.search(r'(const io_mod = @import\("[^"]*shared/io\.zig"\);\n)', atext)
     anchor_imp = None
     for pat in [r'(const command_router = @import\("[^"]*command_router\.zig"\);\n)', r'(const std = @import\("std"\);\n)']:
         m3 = re.search(pat, atext)
         if m3:
             anchor_imp = m3.group(1)
             break
-    atext = atext.replace(anchor_imp, anchor_imp +
-        'const fx_companion = @import("../workspace/fx_companion.zig");\n', 1)
+    if "const fx_companion" not in atext:
+        atext = atext.replace(anchor_imp, anchor_imp +
+            'const fx_companion = @import("../workspace/fx_companion.zig");\n', 1)
     appc.write_text(atext)
     print("inject: /benchmark applied to", appc)
+
+    # --- register /benchmark in the slash registry (drives autocomplete+help) ---
+    specs = src / "src" / "builtins" / "commands.zig"
+    stext = specs.read_text()
+    if '"/benchmark"' in stext:
+        print("inject: benchmark spec already present")
+        return 0
+
+    cs = src / "src" / "core" / "slash_commands" / "command_specs.zig"
+    cstext = cs.read_text()
+    if ".benchmark," not in cstext:
+        k = re.search(r'(    version,\n\};)', cstext)
+        if not k:
+            print("inject: anchor not found (SlashKind)", file=sys.stderr)
+            return 1
+        cstext = cstext.replace(k.group(1), '    version,\n    benchmark,\n};', 1)
+        router = src / "src" / "core" / "slash_commands" / "command_router.zig"
+        rtext2 = router.read_text()
+        pc = re.search(r'(        \.version => \.version,\n)', rtext2)
+        if not pc:
+            print("inject: anchor not found (parsedCommand switch)", file=sys.stderr)
+            return 1
+        rtext2 = rtext2.replace(pc.group(1),
+            pc.group(1) + '        .benchmark => .unknown,\n', 1)
+        cs.write_text(cstext)
+        router.write_text(rtext2)
+        print("inject: benchmark kind added")
+
+    anchor_spec = '''    .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },'''
+    new_spec = '''    .{ .kind = .benchmark, .command = "/benchmark", .help_entry = "/benchmark", .completion_description = "fx-companion: run raw speed tests", .presentation_category = .general },'''
+    if anchor_spec not in stext:
+        print("inject: anchor not found (slash_specs)", file=sys.stderr)
+        return 1
+    stext = stext.replace(anchor_spec, anchor_spec + "\n" + new_spec, 1)
+    specs.write_text(stext)
+    print("inject: /benchmark registered for completion")
     _ = changed
     return 0
 
