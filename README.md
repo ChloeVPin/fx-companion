@@ -1,22 +1,16 @@
-<div align="center">
-
-# fx-companion
-
-**Boosted [fx](https://github.com/vercel-labs/fx) for Apple Silicon.**
-
-Stock output · faster traversal · zero config
-
-[![Install](https://img.shields.io/badge/install-npx-111111)](#install)
-[![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-111111)](#requirements)
-[![License](https://img.shields.io/badge/license-Apache--2.0-111111)](#credits--license)
-
-```sh
-npx github:ChloeVPin/fx-companion
 ```
-
-*Same commands. Same output. Faster where it counts.*
-
-</div>
+8888888888 Y88b   d88P  .d8888b.      
+888         Y88b d88P  d88P  Y88b     
+888          Y88o88P   888    888     
+8888888       Y888P    888   Boosted fx for Apple Silicon.
+888           d888b    888            
+888          d88888b   888    888   Stock output - faster traversal - zero config
+888         d88P Y88b  Y88b  d88P     
+888        d88P   Y88b  "Y8888P"   npx github:ChloeVPin/fx-companion
+                                      
+                                      
+                                      
+```
 
 ---
 
