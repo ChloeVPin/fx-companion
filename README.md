@@ -24,7 +24,8 @@ brew tap chloevpin/tap && brew install fx-companion
 ```
 
 **That's it.** Run `fx` like you always do — same commands, same output,
-faster where it counts.
+faster where it counts. Your session header greets you with a gradient
+<span>**✦ BOOSTED**</span> badge so you always know which fx you're running.
 
 </div>
 
@@ -119,7 +120,14 @@ Not yet — the fast path targets macOS arm64 syscalls. Everything falls back
 to stock behavior there.
 </details>
 
-## License
+## Credits & license
 
-Apache-2.0. fx is [vercel-labs/fx](https://github.com/vercel-labs/fx); this
-project accelerates it and claims no affiliation.
+<div align="center">
+
+**Apache-2.0** · © 2026 **ChloeVPin** — the fx-companion accelerator
+
+Built on [**fx**](https://github.com/vercel-labs/fx) by **Vercel Labs** · © Vercel Labs, Inc. · Apache-2.0
+
+Unofficial project — not affiliated with or endorsed by Vercel. See [NOTICE](NOTICE).
+
+</div>

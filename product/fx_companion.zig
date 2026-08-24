@@ -93,6 +93,51 @@ fn isHiddenName(name: []const u8) bool {
     return name.len > 1 and name[0] == '.';
 }
 
+/// True when the accelerated walk will actually engage on this machine.
+/// Drives the BOOSTED badge in the UI header.
+pub fn active() bool {
+    if (comptime builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return false;
+    const off = std.c.getenv("FX_NO_COMPANION");
+    return off == null or off.?[0] == 0;
+}
+
+/// Renders "✦ BOOSTED" with a smooth cyan→violet→magenta per-character
+/// truecolor gradient. Returns an empty slice when inactive or the buffer
+/// is too small, so callers can append it unconditionally. `buf` must be
+/// at least 256 bytes.
+pub fn boostedBadge(buf: []u8) []const u8 {
+    if (!active()) return buf[0..0];
+    const label = "\u{2726} BOOSTED";
+    // Count codepoints so multi-byte chars stay under one escape.
+    var nchars: usize = 0;
+    var pos: usize = 0;
+    while (pos < label.len) {
+        pos += std.unicode.utf8ByteSequenceLength(label[pos]) catch 1;
+        nchars += 1;
+    }
+    var w: usize = 0;
+    var idx: usize = 0;
+    var ci: usize = 0;
+    while (idx < label.len) : (ci += 1) {
+        const cl = std.unicode.utf8ByteSequenceLength(label[idx]) catch 1;
+        const ch = label[idx .. idx + cl];
+        const t = @as(f64, @floatFromInt(ci)) / @as(f64, @floatFromInt(nchars - 1));
+        // three-stop gradient: teal -> violet -> magenta
+        const r: usize = @intFromFloat(if (t < 0.5) 64 + t * 2 * 116 else 180 + (t - 0.5) * 2 * 75);
+        const g: usize = @intFromFloat(if (t < 0.5) 224 - t * 2 * 104 else 120 - (t - 0.5) * 2 * 40);
+        const b: usize = @intFromFloat(200 + t * 55);
+        const written = std.fmt.bufPrint(buf[w..], "\x1b[38;2;{d};{d};{d}m", .{ r, g, b }) catch return buf[0..0];
+        w += written.len;
+        if (w + cl >= buf.len) return buf[0..0];
+        @memcpy(buf[w .. w + cl], ch);
+        w += cl;
+        idx += cl;
+    }
+    const tail = std.fmt.bufPrint(buf[w..], "\x1b[0m", .{}) catch return buf[0..0];
+    w += tail.len;
+    return buf[0..w];
+}
+
 fn isIgnoredName(ignored: []const []const u8, name: []const u8) bool {
     for (ignored) |entry| {
         if (std.mem.eql(u8, name, entry)) return true;

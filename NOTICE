@@ -1,0 +1,19 @@
+fx-companion
+Copyright 2026 ChloeVPin
+
+This product accelerates vercel-labs/fx ("fx") and distributes an additive
+build of it. fx is developed and owned by Vercel Labs:
+
+  fx — https://github.com/vercel-labs/fx
+  Copyright Vercel Labs, Inc.
+
+Both codebases are licensed under the Apache License, Version 2.0 (the
+"License"); a copy is included in the LICENSE file of this repository and
+applies to this distribution as a whole. Unless required by applicable law or
+agreed to in writing, software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+or implied. See the License for the specific language governing permissions
+and limitations under the License.
+
+fx is a trademark of its respective owner; this project is unofficial and
+claims no affiliation with or endorsement by Vercel Labs, Inc.
