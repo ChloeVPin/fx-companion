@@ -13,7 +13,7 @@ extern "c" fn alarm(seconds: c_uint) c_uint;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
-extern "c" fn truncate(path: [*:0]const u8, length: i64) c_int;
+extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
 extern "c" fn __error() *c_int;
 
 const Timespec = extern struct { sec: isize, nsec: isize };
@@ -114,7 +114,10 @@ fn verifyCacheInvalidation(root: []const u8, cap: usize) !void {
     const O_EXCL: c_int = 0x0800;
     const fd = open(mutation_path.ptr, O_WRONLY | O_CREAT | O_EXCL, @as(c_uint, 0o600));
     if (fd < 0) return error.CreateMutationFailed;
-    _ = close(fd);
+    var fd_open = true;
+    defer {
+        if (fd_open) _ = close(fd);
+    }
     var mutation_exists = true;
     defer {
         if (mutation_exists) _ = unlink(mutation_path.ptr);
@@ -122,12 +125,14 @@ fn verifyCacheInvalidation(root: []const u8, cap: usize) !void {
 
     const after_create = try compareFiles(root, options, "cache/after-create");
     if (after_create.hit) return error.StaleCacheAfterCreate;
-    if (truncate(mutation_path.ptr, 1) != 0) {
+    if (ftruncate(fd, 1) != 0) {
         std.debug.print("cache content mutation failed errno={d} path={s}\n", .{ __error().*, mutation_path });
         return error.WriteMutationFailed;
     }
     const after_content_write = try compareFiles(root, options, "cache/after-content-write");
     if (!after_content_write.hit) return error.CacheMissAfterContentOnlyWrite;
+    _ = close(fd);
+    fd_open = false;
     if (unlink(mutation_path.ptr) != 0) return error.DeleteMutationFailed;
     mutation_exists = false;
     const after_delete = try compareFiles(root, options, "cache/after-delete");

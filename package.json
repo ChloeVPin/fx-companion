@@ -1,6 +1,6 @@
 {
   "name": "fx-companion",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Boosted fx for Apple Silicon - stock output, faster traversal. One-command installer.",
   "license": "Apache-2.0",
   "bin": {
