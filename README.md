@@ -2,11 +2,11 @@
 8888888888 Y88b   d88P  .d8888b.      
 888         Y88b d88P  d88P  Y88b     
 888          Y88o88P   888    888     
-8888888       Y888P    888   Boosted fx for Apple Silicon.
+8888888       Y888P    888                              Boosted fx for Apple Silicon.
 888           d888b    888            
-888          d88888b   888    888   Stock output - faster traversal - zero config
+888          d88888b   888    888                       Stock output - faster traversal - zero config
 888         d88P Y88b  Y88b  d88P     
-888        d88P   Y88b  "Y8888P"   npx github:ChloeVPin/fx-companion
+888        d88P   Y88b  "Y8888P"                        npx github:ChloeVPin/fx-companion
                                       
                                       
                                       
