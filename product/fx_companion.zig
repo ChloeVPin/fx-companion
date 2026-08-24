@@ -166,10 +166,23 @@ fn fmtDur(ns: u64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.2} ms", .{f / 1e6}) catch "?";
 }
 
-fn median3(a: u64, b: u64, t3: u64) u64 {
-    var lo = @min(a, b);
-    _ = &lo;
-    return @min(@max(a, b), t3);
+/// Median via insertion sort on a small copy.
+fn medianOf(times: []const u64) u64 {
+    var tmp: [16]u64 = undefined;
+    const n = @min(times.len, tmp.len);
+    @memcpy(tmp[0..n], times[0..n]);
+    std.mem.sort(u64, tmp[0..n], {}, struct {
+        fn lt(_: void, x: u64, y: u64) bool {
+            return x < y;
+        }
+    }.lt);
+    return tmp[n / 2];
+}
+
+fn minOf(times: []const u64) u64 {
+    var m: u64 = std.math.maxInt(u64);
+    for (times) |t| m = @min(m, t);
+    return m;
 }
 
 /// Single-threaded readdir DFS — syscall-for-syscall what stock fx's walker
@@ -229,12 +242,33 @@ pub fn runBenchmark(
 ) !void {
     var aw: std.Io.Writer.Allocating = .fromArrayList(arena, out);
     const w = &aw.writer;
-    const rounds = 3;
+    // Warmup round (untimed): page cache, thread spawn, allocator arenas.
+    {
+        var paths: std.ArrayList([]const u8) = .empty;
+        var overlong: usize = 0;
+        _ = walkPaths(
+            arena,
+            workspace_root,
+            &.{ ".git", ".zig-cache", "zig-out", "node_modules", ".next", "dist", "build", "coverage" },
+            null,
+            true,
+            false,
+            std.math.maxInt(usize),
+            4096,
+            null,
+            &paths,
+            &overlong,
+        ) catch {};
+    }
 
-    // --- accelerated walk ---
-    var comp_times: [3]u64 = undefined;
+    // Timed rounds: median is robust to outliers, best shows the floor.
+    const rounds: usize = 7;
+    var comp_times: [rounds]u64 = undefined;
+    var ref_times: [rounds]u64 = undefined;
     var comp_count: usize = 0;
+    var ref_count: usize = 0;
     var incomplete = false;
+
     for (0..rounds) |i| {
         var paths: std.ArrayList([]const u8) = .empty;
         var overlong: usize = 0;
@@ -259,11 +293,7 @@ pub fn runBenchmark(
         comp_count = paths.items.len;
         incomplete = inc;
     }
-    const comp_med = median3(comp_times[0], comp_times[1], comp_times[2]);
 
-    // --- stock-equivalent reference ---
-    var ref_times: [3]u64 = undefined;
-    var ref_count: usize = 0;
     for (0..rounds) |i| {
         var arena_ref = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer arena_ref.deinit();
@@ -272,8 +302,9 @@ pub fn runBenchmark(
         referenceWalk(arena_ref.allocator(), workspace_root, &ref_count) catch return;
         ref_times[i] = nowNs() - t0;
     }
-    const ref_med = median3(ref_times[0], ref_times[1], ref_times[2]);
 
+    const comp_med = medianOf(&comp_times);
+    const ref_med = medianOf(&ref_times);
     const speedup = if (comp_med > 0)
         @as(f64, @floatFromInt(ref_med)) / @as(f64, @floatFromInt(comp_med))
     else
@@ -289,8 +320,16 @@ pub fn runBenchmark(
     if (incomplete) try w.writeAll("  (walk reported incomplete)\n");
     var b1: [48]u8 = undefined;
     var b2: [48]u8 = undefined;
-    try w.print("  stock-equiv   {s}  (median of {d})\n", .{ fmtDur(ref_med, &b1), rounds });
-    try w.print("  accelerated   {s}  (median of {d}, 8 workers)\n", .{ fmtDur(comp_med, &b2), rounds });
+    var b3: [48]u8 = undefined;
+    var b4: [48]u8 = undefined;
+    try w.print("  stock-equiv   {s} median · {s} best\n", .{
+        fmtDur(ref_med, &b1),
+        fmtDur(minOf(&ref_times), &b2),
+    });
+    try w.print("  accelerated   {s} median · {s} best  (8 workers)\n", .{
+        fmtDur(comp_med, &b3),
+        fmtDur(minOf(&comp_times), &b4),
+    });
     try w.print("  speedup       {d:.2}x{s}\n", .{ speedup, if (speedup < 1.0) "  (tree too small to benefit)" else "" });
     try w.writeAll("\n  FX_NO_COMPANION=1 disables the fast path.\n");
     out.* = aw.toArrayList();
