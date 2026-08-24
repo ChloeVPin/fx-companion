@@ -1,6 +1,20 @@
 <div align="center">
 
-𝑓x
+# fx-companion
+
+**Boosted [fx](https://github.com/vercel-labs/fx) for Apple Silicon.**
+
+Stock output · faster traversal · zero config
+
+[![Install](https://img.shields.io/badge/install-npx-111111)](#install)
+[![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-111111)](#requirements)
+[![License](https://img.shields.io/badge/license-Apache--2.0-111111)](#credits--license)
+
+```sh
+npx github:ChloeVPin/fx-companion
+```
+
+*Same commands. Same output. Faster where it counts.*
 
 </div>
 
@@ -8,138 +22,95 @@
 
 ## Install
 
-<div align="center">
+One command. It downloads a prebuilt binary (checksum verified), retires any
+stock `fx` you already have — your sessions, skills, and settings are never
+touched — and links it onto your PATH.
 
-```sh
-npx github:ChloeVPin/fx-companion
-```
+Before installing anything, the installer runs an equivalence test: boosted
+output must be byte-identical to stock on a known tree. If it isn't, nothing
+is installed.
 
-**That's it.** Downloads the prebuilt binary (checksum-verified), retires any
-stock fx you had — sessions, skills, and settings stay untouched — and you're
-done.
+**Requirements:** macOS on Apple Silicon, Node 18+.
 
-</div>
+## What it does
 
-> [!NOTE]
-> Requires macOS on Apple Silicon and Node 18+.
->
-> **Every release is built in public CI** from vercel-labs/fx at a pinned
-> commit, and the installer refuses to install anything that doesn't pass a
-> byte-identical output self-test. No trust required — reproduce it yourself.
+fx walks your workspace on every turn of its agent loop — single threaded,
+2 KB buffer, one directory at a time. fx-companion replaces that inner loop
+with an eight-worker pool over the same syscalls and 128 KB buffers.
+Everything else is stock fx, unchanged.
 
-<details>
-<summary><b>Commands</b></summary>
-
-```sh
-npx github:ChloeVPin/fx-companion install   # default: download + replace + activate
-npx github:ChloeVPin/fx-companion status    # what's installed, which fx wins on PATH
-```
-
-</details>
-
----
-
-## Why
-
-fx walks your workspace on every turn of its agent loop. On Apple Silicon
-that walk was leaving big wins on the table: a single thread with a 2 KB
-buffer, one directory at a time.
-
-fx-companion swaps that inner loop for an **8-worker pool over the same
-syscalls**, with 128 KB buffers — and nothing else changes:
-
-- **Byte-identical output.** Same paths, same order after sort, same hidden /
-  ignore-list / cap rules. Verified by an equivalence probe on every install.
-- **Purely additive.** Unsupported platform or any hard failure → stock fx,
-  automatically. Kill switch anytime with `FX_NO_COMPANION=1`.
-- **No daemon, no background processes.** The speedup lives inside the binary.
-- **Survives updates? No — it *is* fx.** The formula builds vercel's own
-  source with one additive hook file. New upstream version = new formula bump.
+The booster is purely additive: unsupported platform, any hard failure, or
+`FX_NO_COMPANION=1` falls back to the stock walk automatically.
 
 ## Performance
 
-Measured on macOS arm64 (ReleaseFast, medians). Full methodology in
-[`benchmarks/`](benchmarks).
+Measured on macOS arm64, ReleaseFast, medians of timed runs after warmup.
+Reproduce with [`product/tests_fxcompanion.zig`](product/tests_fxcompanion.zig).
 
-| Surface | Stock fx | Boosted | Speedup |
+| Surface | Stock | Boosted | Speedup |
 |---|---:|---:|---:|
-| Workspace walk, end-to-end (409,600 files) | 1,589–1,685 ms | 347–533 ms | **3.2–4.6×** |
+| Workspace walk, end to end (409,600 files) | 1,589–1,685 ms | 347–533 ms | **3.2–4.6×** |
 | Raw traversal | 213 ms | 104 ms | **2.05×** |
-| State hand-off (vs fork/exec + pipe) | ~2–4 ms | 44 µs | **44–3,716×** |
 
-Every number is reproducible from the bench sources in this repo.
+In any session, `/benchmark` runs raw speed tests on your current workspace:
+stock-equivalent vs accelerated walk, seven rounds each, median and best.
 
-## How it works
+## Updating
 
-```text
-stock fx   ──► single-threaded readdir, 2 KB buffer        ──► 213 ms
-boosted fx ──► 8 workers · getdirentries · 128 KB buffers  ──► 104 ms
-               └─ any failure or non-arm64 ──► stock path, byte-for-byte
+Every release is built in public CI from vercel-labs/fx at a pinned commit,
+gated by the equivalence test before anything is published. To move to a new
+release, run the same install command again. To check what you're running:
+
+```sh
+npx github:ChloeVPin/fx-companion status
 ```
 
-The booster is a single module ([`product/fx_companion.zig`](product/fx_companion.zig))
-plus ~40 injected lines in fx's walker. The installer runs an equivalence
-probe against a known tree before installing anything — if boosted output
-differs from stock by even one byte, it refuses to install.
+## Independence
 
-## Repository layout
-
-```text
-product/     the shippable booster: module, injector, installer, probes
-benchmarks/  every walker, bench harness, and the comparison chart
-src/         daemon research prototype (Mach service, shm state, ZCS format)
-PLAN.md      goals, corrected claims, phased roadmap
-```
+fx-companion is fully self-governed. We read vercel-labs/fx as pinned source;
+we never open issues or pull requests there, never contact the fx team, and
+never modify their repositories. Updating happens on our schedule, tested
+before it reaches you — if an upstream change ever breaks a non-essential
+hook, only that feature is skipped, loudly, and the speed booster still works.
 
 ## FAQ
 
 <details>
-<summary><b>Is this a fork of fx?</b></summary>
+<summary><b>Is this a fork?</b></summary>
 
-No. It builds vercel-labs/fx unmodified plus one additive module with a
-graceful fallback. Remove the module and you have exactly stock fx.
+No. Each release builds vercel-labs/fx unmodified plus one additive module
+with a graceful fallback. Remove the module and you have exactly stock fx.
 </details>
 
 <details>
 <summary><b>How do I go back to stock?</b></summary>
 
-Delete `~/.fx-companion/bin/fx` (or restore your `.stock.bak` backup) — or run `FX_NO_COMPANION=1 fx …` to skip the
-booster per-invocation without uninstalling.
+Restore the `.stock.bak` binary the installer left beside your old one, delete
+`~/.fx-companion/bin/fx`, or run `FX_NO_COMPANION=1 fx …` per invocation.
 </details>
 
 <details>
 <summary><b>Does it work on Intel Macs or Linux?</b></summary>
 
-Not yet — the fast path targets macOS arm64 syscalls. Everything falls back
-to stock behavior there.
+Not yet — the fast path targets macOS arm64 syscalls. Everything else falls
+back to stock behavior.
+</details>
+
+<details>
+<summary><b>Where is my data?</b></summary>
+
+Right where it was. Sessions, chats, skills, and settings in `~/.fx` are never
+read, moved, or modified by the installer.
 </details>
 
 ## Credits & license
 
 <div align="center">
 
-**Apache-2.0** · © 2026 **ChloeVPin** — the fx-companion accelerator
+Apache-2.0 · © 2026 ChloeVPin — the fx-companion accelerator
 
-Built on [**fx**](https://github.com/vercel-labs/fx) by **Vercel Labs** · © Vercel Labs, Inc. · Apache-2.0
+Built on [fx](https://github.com/vercel-labs/fx) by Vercel Labs, Inc. · Apache-2.0
 
-Unofficial project — not affiliated with or endorsed by Vercel. See [NOTICE](NOTICE).
+Unofficial project, not affiliated with or endorsed by Vercel. See [NOTICE](NOTICE).
 
 </div>
-
-## Independence policy
-
-fx-companion is fully self-governed. We **read** vercel-labs/fx as pinned
-source; we never open issues or PRs there, never contact the fx team, and
-never modify their repositories. Our relationship to upstream is strictly
-one-way consumption:
-
-- `PINNED_FX` records exactly which upstream commit each release builds from.
-- `product/inject_hook.py` re-applies our additive hooks onto any new
-  upstream version; every hook is independent, so even if an upstream change
-  breaks a cosmetic anchor (badge, benchmark), the core speed booster still
-  applies and only that feature is skipped — loudly, never silently.
-- `FX_NO_COMPANION=1` always returns you to 100% stock behavior.
-
-Updating is on our schedule, tested before it reaches you:
-CI injects against pinned source, runs the equivalence gate, and publishes
-only if boosted output is byte-identical to stock.
