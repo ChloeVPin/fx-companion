@@ -98,12 +98,45 @@ async function install() {
   fs.rmSync(tmp, { recursive: true, force: true });
 
   console.log(`✓ installed ${INSTALL_DIR}/fx`);
-  console.log('');
-  console.log('Activate (one time) — add to your ~/.zshrc:');
-  console.log(`  export PATH="${INSTALL_DIR}:$PATH"`);
+  activateOnPath();
   console.log('');
   console.log('Then just run `fx` — same commands, same output, faster.');
   console.log('Stock anytime: FX_NO_COMPANION=1 fx …   ·   Sessions/skills/data untouched.');
+}
+
+function activateOnPath() {
+  // Prefer linking into a directory that's already on PATH.
+  const pathDirs = (process.env.PATH || '').split(':');
+  for (const d of ['/opt/homebrew/bin', '/usr/local/bin', ...pathDirs]) {
+    try {
+      if (!d || !fs.existsSync(d)) continue;
+      const st = fs.statSync(d);
+      if (!st.isDirectory()) continue;
+      fs.accessSync(d, fs.constants.W_OK);
+      const link = path.join(d, 'fx');
+      if (fs.existsSync(link)) continue; // don't clobber; retireOld handled known ones
+      fs.symlinkSync(path.join(INSTALL_DIR, 'fx'), link);
+      console.log(`✓ linked ${link} → boosted fx (already on your PATH)`);
+      return;
+    } catch {}
+  }
+  // Fallback: add our bin dir to ~/.zshrc once, between markers.
+  const zshrc = path.join(os.homedir(), '.zshrc');
+  const begin = '# >>> fx-companion >>>';
+  const end = '# <<< fx-companion <<<';
+  try {
+    let cur = '';
+    if (fs.existsSync(zshrc)) cur = fs.readFileSync(zshrc, 'utf8');
+    if (!cur.includes(begin)) {
+      const block = `\n${begin}\nexport PATH="${INSTALL_DIR}:$PATH"\n${end}\n`;
+      fs.appendFileSync(zshrc, block);
+      console.log(`✓ added ${INSTALL_DIR} to your ~/.zshrc (open a new tab to pick it up)`);
+    } else {
+      console.log('✓ ~/.zshrc already activates fx-companion');
+    }
+  } catch {
+    console.log(`add to your ~/.zshrc:  export PATH="${INSTALL_DIR}:$PATH"`);
+  }
 }
 
 function status() {
