@@ -68,9 +68,10 @@ def main() -> int:
     src = Path(sys.argv[1])
     ws = src / "src" / "core" / "workspace" / "workspace_files.zig"
     render = src / "src" / "ui" / "render.zig"
-    if not ws.exists() or not render.exists():
-        print("inject: missing expected fx source files", file=sys.stderr)
+    if not ws.exists():
+        print("inject: missing workspace_files.zig", file=sys.stderr)
         return 1
+    problems = []
     text = ws.read_text()
     changed = False
 
@@ -122,25 +123,27 @@ def main() -> int:
         print("inject: badge already present")
     else:
         if WELCOME_OLD not in rtext:
-            print("inject: anchor not found (welcomeMessage)", file=sys.stderr)
-            return 1
-        rtext = rtext.replace(WELCOME_OLD, WELCOME_NEW, 1)
-        m = re.search(r'(const main = @import\("\.\./main\.zig"\);\n)', rtext)
-        if not m:
-            print("inject: anchor not found (render import)", file=sys.stderr)
-            return 1
-        rtext = rtext.replace(m.group(1),
-                              m.group(1) + 'const fx_companion = @import("../core/workspace/fx_companion.zig");\n', 1)
-        render.write_text(rtext)
-        print("inject: badge applied to", render)
+            problems.append("badge: welcomeMessage anchor changed upstream")
+        else:
+            rtext = rtext.replace(WELCOME_OLD, WELCOME_NEW, 1)
+            m = re.search(r'(const main = @import\("\.\./main\.zig"\);\n)', rtext)
+            if not m:
+                problems.append("badge: render import anchor changed")
+            else:
+                rtext = rtext.replace(m.group(1),
+                                      m.group(1) + 'const fx_companion = @import("../core/workspace/fx_companion.zig");\n', 1)
+                render.write_text(rtext)
+                print("inject: badge applied to", render)
 
     # --- app_commands.zig: /benchmark slash command (ours, via unknown-cmd hook) ---
     appc = src / "src" / "core" / "app" / "app_commands.zig"
     if not appc.exists():
-        print("inject: missing app_commands.zig", file=sys.stderr)
-        return 1
+        problems.append("benchmark handler: app_commands.zig missing")
+        atext = None
     atext = appc.read_text()
-    if "/benchmark" in atext:
+    if atext is None:
+        pass
+    elif "/benchmark" in atext:
         print("inject: benchmark handler already present")
         old_unknown = None
     else:
