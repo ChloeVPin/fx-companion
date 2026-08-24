@@ -742,7 +742,6 @@ const BenchmarkPair = struct {
 
 const interactive_probe_cap: usize = 10_000;
 const interactive_probe_budget_ms: usize = 100;
-const interactive_full_profile_max_ns: u64 = 10_000_000;
 
 const ProbeStatus = enum {
     complete,
@@ -955,9 +954,7 @@ pub fn runBenchmark(
 ) !void {
     const preflight = interactiveProbe(workspace_root);
     const no_cache = std.c.getenv("FX_COMPANION_NO_CACHE");
-    if (preflight.status != .complete or preflight.elapsed_ns > interactive_full_profile_max_ns or
-        (no_cache != null and no_cache.?[0] != 0))
-    {
+    if (preflight.status != .complete or (no_cache != null and no_cache.?[0] != 0)) {
         return writeResponsiveProfile(arena, workspace_root, preflight, out);
     }
 

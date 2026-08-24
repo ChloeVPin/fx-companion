@@ -87,14 +87,14 @@ knew whether the workspace could retain a snapshot. From `/Users/chloe`, the
 standalone owner reproduced the UI path in 23.04 seconds and ended with
 `profile unavailable: CacheUnavailable`.
 
-The v0.2.2 path first runs an uncached probe bounded by 10,000 paths and a
+The v0.2.3 path first runs an uncached probe bounded by 10,000 paths and a
 100 ms cancellation guard. The same root completed the diagnostic in 0.04
 seconds, reported 10,000 paths and `incomplete=true`, and made no equivalence
 or speedup claim for that subset. This is a single before/after regression
 measurement, not a throughput benchmark or median.
 
 ```sh
-for ref in v0.2.1 v0.2.2; do
+for ref in v0.2.1 v0.2.3; do
   product_tmp=$(mktemp -d /tmp/fxc-product.XXXXXX)
   source_tmp=$(mktemp -d /tmp/fxc-source.XXXXXX)
   git archive "$ref" | tar -x -C "$product_tmp"
@@ -109,6 +109,9 @@ done
 A deterministic 10,100-file fixture also exercises the responsive branch in
 the public release gate. A small fixture separately requires the full
 seven-round output, so the guard cannot silently replace every profile.
+The unpublished v0.2.2 tag used an additional 10 ms promotion threshold; CI
+showed that threshold was sensitive to runner load even on the tiny fixture.
+v0.2.3 relies on the deterministic path cap and 100 ms cancellation guard.
 
 ## Rejected: FSEvents-only invalidation
 
