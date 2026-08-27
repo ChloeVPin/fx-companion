@@ -31,7 +31,7 @@ fn runOne(root: []const u8, target_files: bool, include_hidden: bool) !Expected 
         null,
         target_files,
         include_hidden,
-        100_000,
+        std.math.maxInt(usize),
         4096,
         null,
         &paths,

@@ -1,58 +1,36 @@
 #!/usr/bin/env bash
 # fxc — fx-companion booster manager.
-#   fxc sync    re-apply the booster to the current/newest fx source and rebuild
-#   fxc status  show whether the running fx binary carries the booster
+#   fxc sync           rebuild from PINNED_FX
+#   fxc sync --latest  probe origin/main; advance the pin only if gates pass
+#   fxc status         show whether the running fx binary carries the booster
 set -euo pipefail
 
 FXC_HOME="${FX_COMPANION_HOME:-$HOME/.fx-companion}"
-UPSTREAM="${FX_UPSTREAM_DIR:-$FXC_HOME/upstream}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 die() { echo "fxc: $*" >&2; exit 1; }
-
-ensure_upstream() {
-  if [ ! -f "$UPSTREAM/build.zig" ]; then
-    echo "fxc: cloning vercel-labs/fx into $UPSTREAM"
-    git clone --depth 1 https://github.com/vercel-labs/fx "$UPSTREAM"
-  fi
-}
-
-build_and_install() {
-  local dir="$1"
-  echo "fxc: building fx (ReleaseFast) in $dir"
-  (cd "$dir" && zig build -Doptimize=ReleaseFast)
-  mkdir -p "$FXC_HOME/bin"
-  cp "$dir/zig-out/bin/fx" "$FXC_HOME/bin/fx"
-  # Put boosted fx first on PATH ahead of ~/.local/bin/fx (stock).
-  case ":$PATH:" in
-    *":$FXC_HOME/bin:"*) ;;
-    *) die "add $FXC_HOME/bin to your PATH (see install.sh)" ;;
-  esac
-  echo "fxc: installed $FXC_HOME/bin/fx"
-}
 
 cmd="${1:-}"
 case "$cmd" in
   sync)
-    ensure_upstream
-    git -C "$UPSTREAM" fetch --depth 1 origin main
-    git -C "$UPSTREAM" reset --hard origin/main
-    python3 "$FXC_HOME/inject_hook.py" "$UPSTREAM" || die "hook injection failed (upstream changed?)"
-    build_and_install "$UPSTREAM"
-    echo "fxc: sync complete — booster re-attached on top of latest stock fx"
+    shift || true
+    exec bash "$HERE/sync.sh" "${1:-}"
     ;;
   status)
     bin="$(command -v fx || true)"
     [ -n "$bin" ] || die "no fx on PATH"
     echo "fx binary: $bin"
-    if strings "$bin" 2>/dev/null | grep -c "fx-companion" | grep -qv '^0$'; then
+    if strings "$bin" 2>/dev/null | grep -c "FX_NO_COMPANION" | grep -qv '^0$'; then
       echo "booster: PRESENT"
     else
       echo "booster: absent (stock fx)"
     fi
-    FX_NO_COMPANION=1 "$bin" --version >/dev/null 2>&1 && true
+    if [ -f "$FXC_HOME/PINNED_FX" ]; then
+      echo "pin: $(tr -d '[:space:]' < "$FXC_HOME/PINNED_FX")"
+    fi
     ;;
   *)
-    sed -n '2,5p' "$0"
+    sed -n '2,6p' "$0"
     exit 1
     ;;
 esac

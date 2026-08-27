@@ -4,7 +4,7 @@
 **License:** Apache-2.0
 **Primary Platform:** macOS on Apple Silicon (M-series)
 **Language:** Zig 0.16+ for new code; C only for syscalls Apple does not expose to Zig cleanly.
-**Compatibility pin:** fx `669ef8a7f0bf6b13a1722bfd434fb9fc61d01511`. `PINNED_FX` is authoritative.
+**Compatibility pin:** fx `8d6152de17905429ad78decdb475df8cfd04f557`. `PINNED_FX` is authoritative.
 
 ## 1. Vision
 

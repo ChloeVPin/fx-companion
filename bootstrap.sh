@@ -18,7 +18,7 @@ command -v zig >/dev/null || {
   exit 1
 }
 
-for f in fx_companion.zig inject_hook.py fxc tests_fxcompanion.zig install.sh; do
+for f in fx_companion.zig inject_hook.py fxc tests_fxcompanion.zig install.sh sync.sh benchmark_runner.zig profile_run.zig; do
   echo "bootstrap: fetching $f"
   curl -fsSL "$BASE/$f" -o "$TMP/$f"
 done

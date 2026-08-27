@@ -32,12 +32,16 @@ replaces anything.
 
 ## What it does
 
-fx walks your workspace throughout the agent loop — single threaded, 2 KB
-buffer, one directory at a time. fx-companion replaces sorted walks with an
-eight-worker pool and 128 KB buffers, then retains the packed sorted result.
-Repeat walks validate every traversed directory in parallel and materialize
-the snapshot without rereading the tree. Content edits stay warm; path changes
-invalidate it.
+On git workspaces, production discover is `git ls-files`. Companion snapshots
+that parsed list against `.git` / HEAD / index identity and materializes
+repeats without re-execing git. Content edits in tracked files stay warm;
+index, add, rm, and branch changes miss.
+
+Non-git trees and `force_fallback` still use recursive walks. Companion
+replaces sorted walks with an eight-worker pool and 128 KB buffers, then
+retains the packed sorted result. Repeat walks validate every traversed
+directory in parallel and materialize the snapshot without rereading the tree.
+Content edits stay warm; path changes invalidate it.
 
 Source-order walks stay stock. If the 100,000-entry cap truncates a tree, the
 first call uses stock's exact first-N result and snapshots that result for
@@ -49,18 +53,26 @@ The booster is purely additive: unsupported platform, any hard failure, or
 
 ## Performance
 
-Apple M2, macOS 27 arm64, ReleaseFast. One untimed pair, seven timed pairs,
-alternating order, fresh arenas, byte comparison every round. Medians below;
-best times and every raw round are in the [benchmark record](benchmarks/results/2026-08-24-apple-silicon.md).
+Apple M2, macOS 27 arm64, ReleaseFast, fx `8d6152d`. One untimed pair, seven
+timed pairs, alternating order, fresh arenas, byte comparison every round.
+Medians below; best times and raw rounds:
+[recursive fallback](benchmarks/results/2026-08-26-apple-silicon.md) ·
+[production engagement](benchmarks/results/2026-08-26-engagement.md).
 
-| Tree / cap | Stock | Cold | Warm | Warm speedup |
-|---|---:|---:|---:|---:|
-| 409,600 files / 100,000 | 80.251 ms | 441.038 ms | 5.100 ms | **15.737×** |
-| 409,600 files / 600,000 | 497.828 ms | 222.844 ms | 5.511 ms | **90.332×** |
-| 8 files / 100,000 | 0.158 ms | 0.441 ms | 0.221 ms | **0.713×** |
+Production `discover()` uses `git ls-files`. Companion skips that path unless
+the git-list snapshot hits. Recursive 70× numbers are **fallback only**
+(`force_fallback`, sorted walk).
 
-The exact capped cold path loses and breaks even on the sixth unchanged
-name-set walk in this corpus. Tiny trees lose by 0.063 ms warm.
+| Path | Tree | Cold | Warm | Notes |
+|---|---|---:|---:|---|
+| git-primary (production) | this repo, 43 files | 23.543 ms | 0.044 ms | **538×**, hash-identical |
+| git-primary (production) | /opt/homebrew, 3130 files | 13.748 ms | 0.035 ms | **398×**, hash-identical |
+| recursive fallback | 409,600 files / 100,000 | 95.497 ms | 1.199 ms | **69.697×** |
+| recursive fallback | 409,600 files / 600,000 | 366.373 ms | 4.602 ms | **79.605×** |
+| recursive fallback | 8 files / 100,000 | 0.185 ms | 0.017 ms | **1.284×** vs stock 0.022 ms |
+
+Git warm does not re-exec `git`. Recursive capped cold is still stock plus
+snapshot fill (95.5 vs 83.6 ms stock), not the old 441 ms discarded walk.
 
 ```sh
 zig run benchmarks/make_anchor.zig -lc -OReleaseFast -- /tmp/fxanchor-new 4096 100
@@ -79,7 +91,8 @@ boosted-warm result is compared byte-for-byte (ordered paths and result
 metadata) before a result is printed. Child startup and boosted cold-fill time
 are explicitly excluded from the repeat-discovery measurement.
 
-`/profile` retains the bounded syscall/cache diagnostic view. Neither command
+`/profile` prints production discover first (`source=git|recursive`, companion
+hit/miss, git_list_ns) then the recursive walk diagnostic. Neither command
 makes a synthetic or paid model request.
 
 The side-by-side benchmark is also a release gate. Reproduce its deterministic
@@ -93,13 +106,24 @@ fx --fx-companion-benchmark /tmp/fxc-benchmark
 FSEvents-only invalidation was rejected. A synchronous flush took 0.012 ms,
 but an immediate file creation was not visible until 11.741 ms and nine
 flush/poll attempts. The reproducible failed experiment is in the
-[benchmark record](benchmarks/results/2026-08-24-apple-silicon.md#rejected-fsevents-only-invalidation).
+[2026-08-24 record](benchmarks/results/2026-08-24-apple-silicon.md#rejected-fsevents-only-invalidation).
 
 ## Updating
 
-Every release is built in public CI from vercel-labs/fx at a pinned commit,
-gated by the equivalence test before anything is published. To move to a new
-release, run the same install command again. To check what you're running:
+Every release is built in public CI from vercel-labs/fx at the commit in
+`PINNED_FX`, gated by the equivalence test before anything is published.
+`fxc sync` rebuilds that pin. `fxc sync --latest` probes `origin/main` and
+advances the pin only after inject + equivalence pass. If Vercel moves the
+required walk seam, sync keeps the last known-good boosted binary and skips
+the new build.
+
+After a stock `fx upgrade`, re-run:
+
+```sh
+fxc sync
+```
+
+To check what you're running:
 
 ```sh
 npx github:ChloeVPin/fx-companion status
