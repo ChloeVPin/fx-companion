@@ -522,11 +522,80 @@ fn persistDiskSnapshot(cache: *const SnapshotCache) void {
     const blob = cache.blob orelse return;
     const paths = cache.paths orelse return;
     const directories = cache.directories orelse return;
+    persistDiskSnapshotStaged(
+        cache.key[0..cache.key_len],
+        blob,
+        paths,
+        directories,
+        cache.incomplete,
+        cache.overlong,
+    );
+}
+
+/// Coalesced single-buffer persist: same on-disk format as before, but one
+/// large write instead of 12 + 3*N small write() syscalls (300k+ calls for
+/// 100k directories). Takes plain slices so callers can persist without
+/// holding the snapshot-cache lock.
+fn persistDiskSnapshotStaged(
+    key: []const u8,
+    blob: []const u8,
+    paths: []const CachedPath,
+    directories: []const CachedDirectory,
+    incomplete: bool,
+    overlong: usize,
+) void {
+    if (key.len > CACHE_KEY_BYTES) return;
+    if (paths.len > CACHE_MAX_PATHS) return;
+    if (blob.len > CACHE_MAX_PATH_BYTES) return;
+    if (directories.len > CACHE_MAX_DIRECTORIES) return;
+    if (blob.len > std.math.maxInt(u32)) return;
     if (!ensureSnapshotDir()) return;
     var path_buf: [768]u8 = undefined;
-    const path = diskSnapshotPath(cache.key[0..cache.key_len], &path_buf) orelse return;
+    const path = diskSnapshotPath(key, &path_buf) orelse return;
     var tmp_buf: [780]u8 = undefined;
     const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{path}) catch return;
+
+    // Total: magic(4) version(4) key_len(4) key incomplete(1) overlong(8)
+    // path_count(4) blob_len(4) blob paths(*8) dir_count(4) per-dir(4+len+40).
+    var total: usize = 4 + 4 + 4 + key.len + 1 + 8 + 4 + 4 + blob.len + paths.len * 8 + 4;
+    for (directories) |directory| {
+        total = std.math.add(usize, total, 4 + directory.path.len + @sizeOf(DirectoryStamp)) catch return;
+    }
+    const buf = std.heap.c_allocator.alloc(u8, total) catch return;
+    defer std.heap.c_allocator.free(buf);
+    var off: usize = 0;
+    const put = struct {
+        fn bytes(dst: []u8, o: *usize, src: []const u8) void {
+            @memcpy(dst[o.*..][0..src.len], src);
+            o.* += src.len;
+        }
+    }.bytes;
+    put(buf, &off, std.mem.asBytes(&DISK_CACHE_MAGIC));
+    put(buf, &off, std.mem.asBytes(&DISK_CACHE_VERSION));
+    const key_len: u32 = @intCast(key.len);
+    put(buf, &off, std.mem.asBytes(&key_len));
+    put(buf, &off, key);
+    const incomplete_u8: u8 = @intFromBool(incomplete);
+    put(buf, &off, std.mem.asBytes(&incomplete_u8));
+    const overlong_u64: u64 = @intCast(overlong);
+    put(buf, &off, std.mem.asBytes(&overlong_u64));
+    const path_count: u32 = @intCast(paths.len);
+    put(buf, &off, std.mem.asBytes(&path_count));
+    const blob_len: u32 = @intCast(blob.len);
+    put(buf, &off, std.mem.asBytes(&blob_len));
+    put(buf, &off, blob);
+    put(buf, &off, std.mem.sliceAsBytes(paths));
+    const dir_count: u32 = @intCast(directories.len);
+    put(buf, &off, std.mem.asBytes(&dir_count));
+    for (directories) |directory| {
+        const path_len: u32 = @intCast(directory.path.len);
+        put(buf, &off, std.mem.asBytes(&path_len));
+        put(buf, &off, directory.path);
+        const stamp = stampFromStat(directory.expected);
+        put(buf, &off, std.mem.asBytes(&stamp));
+    }
+    std.debug.assert(off == total);
+
     const fd = c.open(tmp.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
     if (fd < 0) return;
     var ok = false;
@@ -534,119 +603,124 @@ fn persistDiskSnapshot(cache: *const SnapshotCache) void {
         _ = close(fd);
         if (!ok) _ = unlink(tmp.ptr);
     }
-
-    const Writer = struct {
-        fd: c_int,
-        fn writeAll(self: @This(), bytes: []const u8) bool {
-            var offset: usize = 0;
-            while (offset < bytes.len) {
-                const n = write(self.fd, bytes.ptr + offset, bytes.len - offset);
-                if (n <= 0) return false;
-                offset += @intCast(n);
-            }
-            return true;
-        }
-    };
-    const w = Writer{ .fd = fd };
-    const magic = DISK_CACHE_MAGIC;
-    const version = DISK_CACHE_VERSION;
-    const key_len: u32 = @intCast(cache.key_len);
-    const incomplete: u8 = @intFromBool(cache.incomplete);
-    const overlong: u64 = cache.overlong;
-    const path_count: u32 = @intCast(paths.len);
-    const blob_len: u32 = @intCast(blob.len);
-    const dir_count: u32 = @intCast(directories.len);
-    if (!w.writeAll(std.mem.asBytes(&magic))) return;
-    if (!w.writeAll(std.mem.asBytes(&version))) return;
-    if (!w.writeAll(std.mem.asBytes(&key_len))) return;
-    if (!w.writeAll(cache.key[0..cache.key_len])) return;
-    if (!w.writeAll(std.mem.asBytes(&incomplete))) return;
-    if (!w.writeAll(std.mem.asBytes(&overlong))) return;
-    if (!w.writeAll(std.mem.asBytes(&path_count))) return;
-    if (!w.writeAll(std.mem.asBytes(&blob_len))) return;
-    if (!w.writeAll(blob)) return;
-    if (!w.writeAll(std.mem.sliceAsBytes(paths))) return;
-    if (!w.writeAll(std.mem.asBytes(&dir_count))) return;
-    for (directories) |directory| {
-        const path_len: u32 = @intCast(directory.path.len);
-        if (!w.writeAll(std.mem.asBytes(&path_len))) return;
-        if (!w.writeAll(directory.path)) return;
-        const stamp = stampFromStat(directory.expected);
-        if (!w.writeAll(std.mem.asBytes(&stamp))) return;
+    var written: usize = 0;
+    while (written < buf.len) {
+        const n = write(fd, buf.ptr + written, buf.len - written);
+        if (n <= 0) return;
+        written += @intCast(n);
     }
     if (rename(tmp.ptr, path.ptr) != 0) return;
     ok = true;
 }
 
-fn loadDiskSnapshot(cache: *SnapshotCache, key: *const CacheKey) bool {
+const StagedSnapshot = struct {
+    blob: []u8,
+    paths: []CachedPath,
+    directories: []CachedDirectory,
+    incomplete: bool,
+    overlong: usize,
+};
+
+fn freeStagedSnapshot(staged: *StagedSnapshot) void {
+    for (staged.directories) |directory| std.heap.c_allocator.free(directory.path);
+    std.heap.c_allocator.free(staged.directories);
+    std.heap.c_allocator.free(staged.paths);
+    std.heap.c_allocator.free(staged.blob);
+    staged.* = undefined;
+}
+
+/// Single-read staged load: same on-disk format, but one large read instead
+/// of N small read() syscalls, decoded from memory with identical cap and
+/// bounds checks. Touches no shared cache state, so callers can load and
+/// validate without holding the snapshot-cache lock.
+fn loadDiskSnapshotStaged(key: *const CacheKey) ?StagedSnapshot {
     var path_buf: [768]u8 = undefined;
-    const path = diskSnapshotPath(key.bytes[0..key.len], &path_buf) orelse return false;
+    const path = diskSnapshotPath(key.bytes[0..key.len], &path_buf) orelse return null;
     const fd = open(path.ptr, O_RDONLY);
-    if (fd < 0) return false;
+    if (fd < 0) return null;
     defer _ = close(fd);
 
-    const Reader = struct {
-        fd: c_int,
-        fn readAll(self: @This(), bytes: []u8) bool {
-            var offset: usize = 0;
-            while (offset < bytes.len) {
-                const n = read(self.fd, bytes.ptr + offset, bytes.len - offset);
-                if (n <= 0) return false;
-                offset += @intCast(n);
-            }
+    var fst: c.struct_stat = undefined;
+    if (c.fstat(fd, &fst) != 0) return null;
+    const file_size: usize = @intCast(@max(fst.st_size, 0));
+    // Lower bound: fixed header + key. Upper bound: worst-case caps
+    // (~550 MiB) with headroom; rejects corrupt huge sizes before alloc.
+    const min_size: usize = 4 + 4 + 4 + key.len + 1 + 8 + 4 + 4;
+    const max_size: usize = 640 * 1024 * 1024;
+    if (file_size < min_size or file_size > max_size) return null;
+    const file = std.heap.c_allocator.alloc(u8, file_size) catch return null;
+    defer std.heap.c_allocator.free(file);
+    var got: usize = 0;
+    while (got < file.len) {
+        const n = read(fd, file.ptr + got, file.len - got);
+        if (n <= 0) return null;
+        got += @intCast(n);
+    }
+
+    var off: usize = 0;
+    const take = struct {
+        fn bytes(src: []const u8, o: *usize, dst: []u8) bool {
+            if (dst.len > src.len - o.*) return false;
+            @memcpy(dst, src[o.*..][0..dst.len]);
+            o.* += dst.len;
             return true;
         }
-    };
-    const r = Reader{ .fd = fd };
+    }.bytes;
     var magic: u32 = 0;
     var version: u32 = 0;
     var key_len: u32 = 0;
-    if (!r.readAll(std.mem.asBytes(&magic)) or magic != DISK_CACHE_MAGIC) return false;
-    if (!r.readAll(std.mem.asBytes(&version)) or version != DISK_CACHE_VERSION) return false;
-    if (!r.readAll(std.mem.asBytes(&key_len)) or key_len != key.len or key_len > CACHE_KEY_BYTES) return false;
-    var file_key: [CACHE_KEY_BYTES]u8 = undefined;
-    if (!r.readAll(file_key[0..key_len])) return false;
-    if (!std.mem.eql(u8, file_key[0..key_len], key.bytes[0..key.len])) return false;
+    if (!take(file, &off, std.mem.asBytes(&magic)) or magic != DISK_CACHE_MAGIC) return null;
+    if (!take(file, &off, std.mem.asBytes(&version)) or version != DISK_CACHE_VERSION) return null;
+    if (!take(file, &off, std.mem.asBytes(&key_len)) or key_len != key.len or key_len > CACHE_KEY_BYTES) return null;
+    if (key_len > file.len - off) return null;
+    if (!std.mem.eql(u8, file[off..][0..key_len], key.bytes[0..key.len])) return null;
+    off += key_len;
     var incomplete: u8 = 0;
     var overlong: u64 = 0;
     var path_count: u32 = 0;
     var blob_len: u32 = 0;
-    if (!r.readAll(std.mem.asBytes(&incomplete))) return false;
-    if (!r.readAll(std.mem.asBytes(&overlong))) return false;
-    if (!r.readAll(std.mem.asBytes(&path_count))) return false;
-    if (!r.readAll(std.mem.asBytes(&blob_len))) return false;
-    if (path_count > CACHE_MAX_PATHS or blob_len > CACHE_MAX_PATH_BYTES) return false;
-    const blob = std.heap.c_allocator.alloc(u8, blob_len) catch return false;
+    if (!take(file, &off, std.mem.asBytes(&incomplete))) return null;
+    if (!take(file, &off, std.mem.asBytes(&overlong))) return null;
+    if (!take(file, &off, std.mem.asBytes(&path_count))) return null;
+    if (!take(file, &off, std.mem.asBytes(&blob_len))) return null;
+    if (path_count > CACHE_MAX_PATHS or blob_len > CACHE_MAX_PATH_BYTES) return null;
+    if (blob_len > file.len - off) return null;
+    const blob = std.heap.c_allocator.alloc(u8, blob_len) catch return null;
     errdefer std.heap.c_allocator.free(blob);
-    if (!r.readAll(blob)) {
+    @memcpy(blob, file[off..][0..blob_len]);
+    off += blob_len;
+    const paths_byte_len = @as(usize, path_count) * @sizeOf(CachedPath);
+    if (paths_byte_len > file.len - off) {
         std.heap.c_allocator.free(blob);
-        return false;
+        return null;
     }
     const paths = std.heap.c_allocator.alloc(CachedPath, path_count) catch {
         std.heap.c_allocator.free(blob);
-        return false;
+        return null;
     };
-    if (!r.readAll(std.mem.sliceAsBytes(paths))) {
-        std.heap.c_allocator.free(blob);
-        std.heap.c_allocator.free(paths);
-        return false;
-    }
+    errdefer std.heap.c_allocator.free(paths);
+    @memcpy(std.mem.sliceAsBytes(paths), file[off..][0..paths_byte_len]);
+    off += paths_byte_len;
     var dir_count: u32 = 0;
-    if (!r.readAll(std.mem.asBytes(&dir_count)) or dir_count > CACHE_MAX_DIRECTORIES) {
+    if (!take(file, &off, std.mem.asBytes(&dir_count)) or dir_count > CACHE_MAX_DIRECTORIES) {
         std.heap.c_allocator.free(blob);
         std.heap.c_allocator.free(paths);
-        return false;
+        return null;
     }
     const directories = std.heap.c_allocator.alloc(CachedDirectory, dir_count) catch {
         std.heap.c_allocator.free(blob);
         std.heap.c_allocator.free(paths);
-        return false;
+        return null;
     };
     var initialized: usize = 0;
     var failed = false;
     while (initialized < dir_count) {
         var path_len: u32 = 0;
-        if (!r.readAll(std.mem.asBytes(&path_len)) or path_len > 4096) {
+        if (!take(file, &off, std.mem.asBytes(&path_len)) or path_len > 4096) {
+            failed = true;
+            break;
+        }
+        if (path_len > file.len - off or @sizeOf(DirectoryStamp) > file.len - off - path_len) {
             failed = true;
             break;
         }
@@ -654,17 +728,11 @@ fn loadDiskSnapshot(cache: *SnapshotCache, key: *const CacheKey) bool {
             failed = true;
             break;
         };
-        if (!r.readAll(dir_path[0..path_len])) {
-            std.heap.c_allocator.free(dir_path);
-            failed = true;
-            break;
-        }
+        @memcpy(dir_path[0..path_len], file[off..][0..path_len]);
+        off += path_len;
         var stamp: DirectoryStamp = undefined;
-        if (!r.readAll(std.mem.asBytes(&stamp))) {
-            std.heap.c_allocator.free(dir_path);
-            failed = true;
-            break;
-        }
+        @memcpy(std.mem.asBytes(&stamp), file[off..][0..@sizeOf(DirectoryStamp)]);
+        off += @sizeOf(DirectoryStamp);
         directories[initialized] = .{ .path = dir_path, .expected = statFromStamp(stamp) };
         initialized += 1;
     }
@@ -673,17 +741,31 @@ fn loadDiskSnapshot(cache: *SnapshotCache, key: *const CacheKey) bool {
         std.heap.c_allocator.free(directories);
         std.heap.c_allocator.free(blob);
         std.heap.c_allocator.free(paths);
-        return false;
+        return null;
     }
 
+    return .{
+        .blob = blob,
+        .paths = paths,
+        .directories = directories,
+        .incomplete = incomplete != 0,
+        .overlong = @intCast(overlong),
+    };
+}
+
+fn loadDiskSnapshot(cache: *SnapshotCache, key: *const CacheKey) bool {
+    // Caller holds cache.mu. Staged load does the file IO into owned
+    // allocations (no shared mutation); install here is a pointer swap.
+    var staged = loadDiskSnapshotStaged(key) orelse return false;
+    errdefer freeStagedSnapshot(&staged);
     cache.clearLocked();
     @memcpy(cache.key[0..key.len], key.bytes[0..key.len]);
     cache.key_len = key.len;
-    cache.blob = blob;
-    cache.paths = paths;
-    cache.directories = directories;
-    cache.incomplete = incomplete != 0;
-    cache.overlong = overlong;
+    cache.blob = staged.blob;
+    cache.paths = staged.paths;
+    cache.directories = staged.directories;
+    cache.incomplete = staged.incomplete;
+    cache.overlong = staged.overlong;
     cache.valid = true;
     return true;
 }
@@ -1574,26 +1656,6 @@ const State = struct {
         self.cond.deinit();
     }
 
-    /// Appends one relative path under the lock, enforcing the candidate
-    /// cap exactly like stock (set incomplete, signal stop). Caller built
-    /// `rel` in `scratch` (arena-owned copy is made here on success).
-    fn appendRel(self: *State, scratch: []const u8) Error!void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.count >= self.candidate_cap) {
-            self.incomplete = true;
-            self.stop_now.store(true, .release);
-            self.cond.broadcast();
-            return;
-        }
-        const rel = self.arena.dupe(u8, scratch) catch return error.OutOfMemory;
-        self.paths.append(self.arena, rel) catch {
-            self.arena.free(rel);
-            return error.OutOfMemory;
-        };
-        self.count += 1;
-    }
-
     fn pushDir(self: *State, child: [:0]u8) void {
         self.mu.lock();
         self.pending.append(std.heap.c_allocator, child) catch {
@@ -1697,11 +1759,17 @@ pub fn walkPaths(
     if (maybe_key) |key_value| {
         var key = key_value;
         const cache = getSnapshotCache();
-        cache.mu.lock();
-        defer cache.mu.unlock();
 
+        // Fast path under lock: in-memory snapshot validate + materialize.
+        // Pointers are only stable while the mutex is held, so this whole
+        // sequence stays inside the critical section. Disk IO and cold
+        // walks below run unlocked on staged (locally-owned) data.
+        cache.mu.lock();
         if (stop_requested) |stop| {
-            if (stop.load(.seq_cst)) return error.Canceled;
+            if (stop.load(.seq_cst)) {
+                cache.mu.unlock();
+                return error.Canceled;
+            }
         }
         if (cacheKeyMatches(cache, &key)) {
             const validation_started = nowNs();
@@ -1710,29 +1778,70 @@ pub fn walkPaths(
             if (unchanged) {
                 try materializeSnapshot(cache, arena, out_paths, out_overlong);
                 if (stop_requested) |stop| {
-                    if (stop.load(.seq_cst)) return error.Canceled;
+                    if (stop.load(.seq_cst)) {
+                        cache.mu.unlock();
+                        return error.Canceled;
+                    }
                 }
                 last_cache_hit.store(true, .release);
                 out_exact.* = true;
-                return cache.incomplete;
+                const hit_incomplete = cache.incomplete;
+                cache.mu.unlock();
+                return hit_incomplete;
             }
             cache.clearLocked();
+        } else {
+            // Another thread may hold an unrelated key; leave it alone here.
+            // Stale same-key entries are cleared on install paths below.
         }
-        if (loadDiskSnapshot(cache, &key)) {
+        cache.mu.unlock();
+
+        // Disk path: load + validate with no shared mutation, then install
+        // under a short lock (pointer swap + materialize only).
+        if (loadDiskSnapshotStaged(&key)) |staged_value| {
+            var staged = staged_value;
+            var installed = false;
+            errdefer if (!installed) freeStagedSnapshot(&staged);
             const validation_started = nowNs();
-            const unchanged = validateSnapshot(cache, workspace_root);
+            const unchanged = validateDirectorySnapshot(staged.directories, workspace_root);
             last_cache_validation_ns.store(nowNs() - validation_started, .release);
             if (unchanged) {
-                try materializeSnapshot(cache, arena, out_paths, out_overlong);
+                cache.mu.lock();
+                // Only evict our own key on failure paths; install wins here
+                // (staged was validated after any concurrent install).
+                cache.clearLocked();
+                @memcpy(cache.key[0..key.len], key.bytes[0..key.len]);
+                cache.key_len = key.len;
+                cache.blob = staged.blob;
+                cache.paths = staged.paths;
+                cache.directories = staged.directories;
+                cache.incomplete = staged.incomplete;
+                cache.overlong = staged.overlong;
+                cache.valid = true;
+                installed = true;
+                materializeSnapshot(cache, arena, out_paths, out_overlong) catch |e| {
+                    cache.clearLocked();
+                    cache.mu.unlock();
+                    return e;
+                };
                 if (stop_requested) |stop| {
-                    if (stop.load(.seq_cst)) return error.Canceled;
+                    if (stop.load(.seq_cst)) {
+                        cache.mu.unlock();
+                        return error.Canceled;
+                    }
                 }
                 last_cache_hit.store(true, .release);
                 out_exact.* = true;
-                return cache.incomplete;
+                const hit_incomplete = cache.incomplete;
+                cache.mu.unlock();
+                return hit_incomplete;
             }
             deleteDiskSnapshot(key.bytes[0..key.len]);
-            cache.clearLocked();
+            freeStagedSnapshot(&staged);
+            installed = true;
+            cache.mu.lock();
+            if (cacheKeyMatches(cache, &key)) cache.clearLocked();
+            cache.mu.unlock();
         }
         if (candidate_cap <= STOCK_FIRST_CAP) {
             return true;
@@ -1758,17 +1867,36 @@ pub fn walkPaths(
         sortPaths(out_paths.items);
         if (incomplete) return true;
 
+        // Build + persist with no lock held; install is a short pointer swap.
         if (buildSnapshot(workspace_root, out_paths.items, validation_dirs.items)) |built| {
+            const owned = built;
+            var installed = false;
+            errdefer if (!installed) {
+                std.heap.c_allocator.free(owned.blob);
+                std.heap.c_allocator.free(owned.paths);
+                freeCachedDirectories(owned.directories);
+            };
+            persistDiskSnapshotStaged(
+                key.bytes[0..key.len],
+                owned.blob,
+                owned.paths,
+                owned.directories,
+                false,
+                out_overlong.*,
+            );
+            cache.mu.lock();
             cache.clearLocked();
             @memcpy(cache.key[0..key.len], key.bytes[0..key.len]);
             cache.key_len = key.len;
-            cache.blob = built.blob;
-            cache.paths = built.paths;
-            cache.directories = built.directories;
+            cache.blob = owned.blob;
+            cache.paths = owned.paths;
+            cache.directories = owned.directories;
             cache.incomplete = false;
             cache.overlong = out_overlong.*;
             cache.valid = true;
-            persistDiskSnapshot(cache);
+            cache.mu.unlock();
+            // Ownership moved to the cache.
+            installed = true;
         }
         out_exact.* = true;
         return false;
@@ -1856,6 +1984,11 @@ fn walkPathsUncached(
     st.initSync();
     defer st.deinitSync();
     defer drainQueue(&st);
+
+    // Pre-reserve so the per-path appends under the mutex rarely realloc.
+    // 4096 pointers (32 KiB) covers small trees entirely and costs nothing
+    // measurable on large ones; growth beyond this stays geometric.
+    out_paths.ensureUnusedCapacity(arena, 4096) catch {};
 
     // Seed scan on this thread; queued subtrees go to the pool.
     const seed_buffer = std.heap.c_allocator.alloc(u8, BUF_SIZE) catch return error.CompanionUnavailable;
@@ -2095,20 +2228,31 @@ fn handleEntry(st: *State, prefix: []const u8, name: []const u8, dtype: u8) Erro
     if (!st.target_files) {
         // directories target: stock order is cap check first (sets
         // incomplete), then overlong count, then emit, then recurse.
+        // Single critical section for cap-check + dupe + append.
         st.mu.lock();
-        const full = st.count >= st.candidate_cap;
-        if (full) {
+        if (st.count >= st.candidate_cap) {
             st.incomplete = true;
             st.stop_now.store(true, .release);
             st.cond.broadcast();
+            st.mu.unlock();
+            return;
         }
-        st.mu.unlock();
-        if (full) return;
         if (child.len > st.max_rel) {
+            st.mu.unlock();
             _ = st.overlong.fetchAdd(1, .monotonic);
             return;
         }
-        try st.appendRel(child);
+        const rel = st.arena.dupe(u8, child) catch {
+            st.mu.unlock();
+            return error.OutOfMemory;
+        };
+        st.paths.append(st.arena, rel) catch {
+            st.arena.free(rel);
+            st.mu.unlock();
+            return error.OutOfMemory;
+        };
+        st.count += 1;
+        st.mu.unlock();
     }
     if (st.stop_now.load(.acquire)) return;
     const owned_child = std.heap.c_allocator.dupeZ(u8, child) catch return error.OutOfMemory;
@@ -2119,30 +2263,45 @@ fn handleEntry(st: *State, prefix: []const u8, name: []const u8, dtype: u8) Erro
 fn emitPath(st: *State, prefix: []const u8, name: []const u8) Error!void {
     // Stock order for files: ignore-name (caller), then CAP check first
     // (sets incomplete and stops the walk), then overlong count, then emit.
+    // Single critical section: build the rel in scratch first (no shared
+    // state), then cap-check + dupe + append under one lock acquisition.
     const rel_len = if (prefix.len == 0) name.len else prefix.len + 1 + name.len;
     var scratch: [4096]u8 = undefined;
+    if (rel_len <= scratch.len) {
+        if (prefix.len == 0) {
+            @memcpy(scratch[0..name.len], name);
+        } else {
+            @memcpy(scratch[0..prefix.len], prefix);
+            scratch[prefix.len] = '/';
+            @memcpy(scratch[prefix.len + 1 ..][0..name.len], name);
+        }
+    }
     st.mu.lock();
-    const full = st.count >= st.candidate_cap;
-    if (full) {
+    if (st.count >= st.candidate_cap) {
         st.incomplete = true;
         st.stop_now.store(true, .release);
         st.cond.broadcast();
         st.mu.unlock();
         return;
     }
-    st.mu.unlock();
     if (rel_len > st.max_rel or rel_len > scratch.len) {
+        // Cap was checked first (stock order); count overlong without
+        // holding the mutex across the atomic.
+        st.mu.unlock();
         _ = st.overlong.fetchAdd(1, .monotonic);
         return;
     }
-    if (prefix.len == 0) {
-        @memcpy(scratch[0..name.len], name);
-    } else {
-        @memcpy(scratch[0..prefix.len], prefix);
-        scratch[prefix.len] = '/';
-        @memcpy(scratch[prefix.len + 1 ..][0..name.len], name);
-    }
-    try st.appendRel(scratch[0..rel_len]);
+    const rel = st.arena.dupe(u8, scratch[0..rel_len]) catch {
+        st.mu.unlock();
+        return error.OutOfMemory;
+    };
+    st.paths.append(st.arena, rel) catch {
+        st.arena.free(rel);
+        st.mu.unlock();
+        return error.OutOfMemory;
+    };
+    st.count += 1;
+    st.mu.unlock();
 }
 
 fn joinPrefix(prefix: []const u8, name: []const u8) Error![:0]u8 {
