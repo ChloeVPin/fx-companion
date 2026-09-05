@@ -29,4 +29,4 @@ The package is unofficial and is not affiliated with the fx project.
 
 ## License
 
-Apache-2.0. See package.json.
+Apache-2.0. See [LICENSE](LICENSE) and [package.json](package.json).
