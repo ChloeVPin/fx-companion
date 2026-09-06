@@ -1,6 +1,6 @@
 # fx-companion Plan
 
-**Status:** Shipping product plus retained research archive (Revised 2026-08-24)
+**Status:** Launch-ready shipping path plus retained research archive (verified 2026-09-06)
 **License:** Apache-2.0
 **Primary Platform:** macOS on Apple Silicon (M-series)
 **Language:** Zig 0.16+ for new code; C only for syscalls Apple does not expose to Zig cleanly.
@@ -19,6 +19,9 @@ Primary focus is deterministic acceleration. Speculative features are strictly o
 - Cold sorted traversal: eight getdirentries workers, 128 KiB buffers.
 - Warm sorted traversal: packed path snapshot, validated on local APFS by parallel
   device/inode/mode/mtime/ctime checks for every traversed directory.
+- Git workspaces: the tracked `git ls-files` result is persisted in the same
+  identity-keyed snapshot store, so new fx processes can reuse it when `.git`,
+  `HEAD`, and `index` stamps are unchanged.
 - Exact cap handling: stock computes the first capped result; later calls reuse only a
   validated byte-identical snapshot. Source-order calls always stay stock.
 - Public-API equivalence gate covers ordering, cap metadata, hidden paths, Git ignores,
@@ -27,6 +30,9 @@ Primary focus is deterministic acceleration. Speculative features are strictly o
   large trees return a bounded no-claim profile instead of blocking on an uncacheable walk.
 - FSEvents-only invalidation rejected: the immediate post-create synchronous flush missed
   the event; reproducible result is recorded under `benchmarks/results/`.
+- Release-first installation verifies SHA-256 assets and falls back to a local pinned
+  source build when no compatible GitHub Release exists. The source path preserves a
+  previous stock executable until build and equivalence checks pass.
 
 The older daemon, XPC, ZeroCopyState, AMX, and predictor sections below are retained as
 research history. They are not the installed product path.

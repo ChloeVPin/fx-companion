@@ -1,6 +1,6 @@
 {
   "name": "fx-companion",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Unofficial Apple Silicon accelerator for fx. Caches git ls-files and sorted walks. Stock-identical output.",
   "license": "Apache-2.0",
   "bin": {

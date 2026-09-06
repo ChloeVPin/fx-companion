@@ -12,14 +12,16 @@ FXC_HOME="${FX_COMPANION_HOME:-$HOME/.fx-companion}"
 command -v zig >/dev/null || { echo "install: zig is required"; exit 1; }
 command -v git >/dev/null || { echo "install: git is required"; exit 1; }
 
-# Retire any previously installed stock fx (user data in ~/.fx untouched).
+bash "$HERE/sync.sh"
+
+# Retire a stock executable only after the pinned source build and equivalence
+# gate have passed. A failed install therefore leaves the user's existing fx
+# command intact. User data in ~/.fx is untouched.
 for old in "$HOME/.local/bin/fx" "/usr/local/bin/fx"; do
   if [ -f "$old" ] && [ ! -L "$old" ]; then
     mv "$old" "$old.stock.bak" && echo "install: retired previous $old (backup at $old.stock.bak)"
   fi
 done
-
-bash "$HERE/sync.sh"
 
 echo
 echo "Activate (one time):"

@@ -629,6 +629,22 @@ fn freeStagedSnapshot(staged: *StagedSnapshot) void {
     staged.* = undefined;
 }
 
+fn installStagedSnapshot(
+    cache: *SnapshotCache,
+    key: *const CacheKey,
+    staged: *const StagedSnapshot,
+) void {
+    cache.clearLocked();
+    @memcpy(cache.key[0..key.len], key.bytes[0..key.len]);
+    cache.key_len = key.len;
+    cache.blob = staged.blob;
+    cache.paths = staged.paths;
+    cache.directories = staged.directories;
+    cache.incomplete = staged.incomplete;
+    cache.overlong = staged.overlong;
+    cache.valid = true;
+}
+
 /// Single-read staged load: same on-disk format, but one large read instead
 /// of N small read() syscalls, decoded from memory with identical cap and
 /// bounds checks. Touches no shared cache state, so callers can load and
@@ -758,15 +774,7 @@ fn loadDiskSnapshot(cache: *SnapshotCache, key: *const CacheKey) bool {
     // allocations (no shared mutation); install here is a pointer swap.
     var staged = loadDiskSnapshotStaged(key) orelse return false;
     errdefer freeStagedSnapshot(&staged);
-    cache.clearLocked();
-    @memcpy(cache.key[0..key.len], key.bytes[0..key.len]);
-    cache.key_len = key.len;
-    cache.blob = staged.blob;
-    cache.paths = staged.paths;
-    cache.directories = staged.directories;
-    cache.incomplete = staged.incomplete;
-    cache.overlong = staged.overlong;
-    cache.valid = true;
+    installStagedSnapshot(cache, key, &staged);
     return true;
 }
 
@@ -934,12 +942,45 @@ pub fn takeGitFiles(
     const key = makeGitCacheKey(workspace_root, ignored_names, include_hidden, candidate_cap, sort_paths) orelse return false;
     const cache = getGitCache();
     cache.mu.lock();
-    defer cache.mu.unlock();
-    if (!cacheKeyMatches(cache, &key)) return false;
-    materializeSnapshot(cache, arena, out_paths, out_overlong) catch return false;
-    out_incomplete.* = cache.incomplete;
-    last_cache_hit.store(true, .release);
-    return true;
+    if (cacheKeyMatches(cache, &key)) {
+        const materialized = materializeSnapshot(cache, arena, out_paths, out_overlong);
+        if (materialized) |_| {
+            out_incomplete.* = cache.incomplete;
+            last_cache_hit.store(true, .release);
+            cache.mu.unlock();
+            return true;
+        } else |_| {}
+    }
+    cache.mu.unlock();
+
+    // Git discovery is the production path for normal workspaces. Reuse its
+    // identity-keyed snapshot across fx processes just like recursive walks,
+    // while leaving the stock git command and parser as the cold fallback.
+    if (loadDiskSnapshotStaged(&key)) |staged_value| {
+        var staged = staged_value;
+        var installed = false;
+        defer if (!installed) freeStagedSnapshot(&staged);
+        // Git snapshots do not carry recursive directory validation records.
+        // Reject any other snapshot shape rather than treating it as a Git
+        // result by accident.
+        if (staged.directories.len != 0) return false;
+
+        cache.mu.lock();
+        installStagedSnapshot(cache, &key, &staged);
+        installed = true;
+        const materialized = materializeSnapshot(cache, arena, out_paths, out_overlong);
+        if (materialized) |_| {
+            out_incomplete.* = cache.incomplete;
+            last_cache_hit.store(true, .release);
+            cache.mu.unlock();
+            return true;
+        } else |_| {
+            cache.clearLocked();
+            cache.mu.unlock();
+            return false;
+        }
+    }
+    return false;
 }
 
 pub fn storeGitFiles(
@@ -959,6 +1000,15 @@ pub fn storeGitFiles(
     if (no_cache != null and no_cache.?[0] != 0) return;
     const key = makeGitCacheKey(workspace_root, ignored_names, include_hidden, candidate_cap, sort_paths) orelse return;
     const built = buildCachedPaths(files) orelse return;
+    const no_directories: []const CachedDirectory = &.{};
+    persistDiskSnapshotStaged(
+        key.bytes[0..key.len],
+        built.blob,
+        built.paths,
+        no_directories,
+        incomplete,
+        skipped_overlong,
+    );
     const cache = getGitCache();
     cache.mu.lock();
     defer cache.mu.unlock();

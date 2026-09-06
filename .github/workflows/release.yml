@@ -23,7 +23,7 @@ jobs:
         run: |
           # Try ziglang.org first, fall back to Homebrew.
           URL="https://ziglang.org/download/0.16.0/zig-macos-aarch64-0.16.0.tar.xz"
-          if curl -fsSL "$URL" -o /tmp/zig.tar.xz 2>/dev/null; then
+          if curl -fsSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" "$URL" -o /tmp/zig.tar.xz 2>/dev/null; then
             mkdir -p /usr/local/opt/zig
             tar -xJf /tmp/zig.tar.xz -C /usr/local/opt/zig --strip-components=1
             echo "/usr/local/opt/zig" >> "$GITHUB_PATH"
@@ -40,10 +40,23 @@ jobs:
           echo "building against vercel-labs/fx@$COMMIT"
 
       - name: Clone upstream fx
-        run: git clone https://github.com/vercel-labs/fx fx-src && git -C fx-src checkout "${{ steps.pin.outputs.commit }}"
+        run: git -c http.userAgent="OpenAI File Downloader, XaiImageApiFetch/1.0" clone https://github.com/vercel-labs/fx fx-src && git -C fx-src checkout "${{ steps.pin.outputs.commit }}"
 
       - name: Inject booster
         run: python3 product/inject_hook.py fx-src
+
+      - name: Installer smoke test
+        run: node product/cli_smoke_test.js
+
+      - name: Package metadata smoke test
+        run: |
+          node --check cli.js
+          npm pack --dry-run --json > /tmp/fxc-npm-pack.json
+          grep -q 'cli.js' /tmp/fxc-npm-pack.json
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            PACKAGE_TAG="v$(node -p "require('./package.json').version")"
+            test "$PACKAGE_TAG" = "$GITHUB_REF_NAME"
+          fi
 
       - name: Equivalence self-test (byte-identical or bust)
         run: |
@@ -52,11 +65,13 @@ jobs:
           cp benchmarks/concurrent_cache_probe.zig fx-src/src/fx_companion_concurrent_cache_probe.zig
           cp benchmarks/cancellation_probe.zig fx-src/src/fx_companion_cancellation_probe.zig
           cp benchmarks/profile_output_probe.zig fx-src/src/fx_companion_profile_output_probe.zig
+          cp benchmarks/git_cache_probe.zig fx-src/src/fx_companion_git_cache_probe.zig
           cd fx-src
           zig build-exe src/tests_fxcompanion.zig -lc -OReleaseFast -femit-bin=/tmp/equiv-probe
           zig build-exe src/fx_companion_concurrent_cache_probe.zig -lc -OReleaseFast -femit-bin=/tmp/concurrent-cache-probe
           zig build-exe src/fx_companion_cancellation_probe.zig -lc -OReleaseFast -femit-bin=/tmp/cancellation-probe
           zig build-exe src/fx_companion_profile_output_probe.zig -lc -OReleaseFast -femit-bin=/tmp/profile-output-probe
+          zig build-exe src/fx_companion_git_cache_probe.zig -lc -OReleaseFast -femit-bin=/tmp/git-cache-probe
 
           TINY=$(mktemp -d /tmp/fxc-tiny.XXXXXX)
           CAPPED=$(mktemp -d /tmp/fxc-capped.XXXXXX)
@@ -77,6 +92,8 @@ jobs:
           ln -s src "$TINY/dirlink"
           git -C "$TINY" init -q
           printf 'ignored/\n' > "$TINY/.gitignore"
+          git -C "$TINY" add -- .gitignore a.txt b.log .dotfile src .hidden node_modules link_to_a dirlink
+          git -C "$TINY" -c user.email=fxc@test -c user.name=fxc -c commit.gpgsign=false commit -qm init
 
           for dir in a b c d; do
             mkdir -p "$CAPPED/$dir"
@@ -104,10 +121,13 @@ jobs:
           /tmp/cancellation-probe /opt/homebrew 100
           /tmp/profile-output-probe "$TINY" --require-full
           /tmp/profile-output-probe "$PROFILE_LARGE" --require-responsive
+          /tmp/git-cache-probe "$TINY" --clear
+          /tmp/git-cache-probe "$TINY"
           rm -f src/tests_fxcompanion.zig \
                 src/fx_companion_concurrent_cache_probe.zig \
                 src/fx_companion_cancellation_probe.zig \
-                src/fx_companion_profile_output_probe.zig
+                src/fx_companion_profile_output_probe.zig \
+                src/fx_companion_git_cache_probe.zig
 
       - name: Build (ReleaseFast)
         run: cd fx-src && zig build -Doptimize=ReleaseFast

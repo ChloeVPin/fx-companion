@@ -13,6 +13,7 @@ else
   PIN_FILE="${FX_PIN_FILE:-$FXC_HOME/PINNED_FX}"
 fi
 TRY_LATEST="${1:-}"
+GIT_HTTP_USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
 
 command -v zig >/dev/null || { echo "sync: zig is required" >&2; exit 1; }
 command -v git >/dev/null || { echo "sync: git is required" >&2; exit 1; }
@@ -36,13 +37,13 @@ chmod +x "$FXC_HOME/fxc"
 
 if [ ! -d "$UPSTREAM/.git" ]; then
   echo "sync: cloning vercel-labs/fx (read-only)"
-  git clone https://github.com/vercel-labs/fx "$UPSTREAM"
+  git -c http.userAgent="$GIT_HTTP_USER_AGENT" clone https://github.com/vercel-labs/fx "$UPSTREAM"
 fi
 
-git -C "$UPSTREAM" fetch --tags --force origin
+git -c http.userAgent="$GIT_HTTP_USER_AGENT" -C "$UPSTREAM" fetch --tags --force origin
 TARGET="$PIN"
 if [ "$TRY_LATEST" = "--latest" ]; then
-  git -C "$UPSTREAM" fetch origin main
+  git -c http.userAgent="$GIT_HTTP_USER_AGENT" -C "$UPSTREAM" fetch origin main
   TARGET="$(git -C "$UPSTREAM" rev-parse origin/main)"
   echo "sync: probing latest origin/main $TARGET (pin is $PIN)"
 fi
