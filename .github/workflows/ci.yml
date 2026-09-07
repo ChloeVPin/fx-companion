@@ -64,6 +64,7 @@ jobs:
           mkdir -p "$ZIG_DIR"
           tar -xJf /tmp/zig.tar.xz -C "$ZIG_DIR" --strip-components=1
           echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          export PATH="$ZIG_DIR:$PATH"
 
       - name: Build pristine pinned workspace fingerprint
         run: |
