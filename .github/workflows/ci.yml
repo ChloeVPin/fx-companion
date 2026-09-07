@@ -60,9 +60,10 @@ jobs:
           SHA256="b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
           curl --fail --silent --show-error --location "$URL" -o /tmp/zig.tar.xz
           printf '%s  %s\n' "$SHA256" /tmp/zig.tar.xz | shasum -a 256 -c -
-          mkdir -p /usr/local/opt/zig
-          tar -xJf /tmp/zig.tar.xz -C /usr/local/opt/zig --strip-components=1
-          echo "/usr/local/opt/zig" >> "$GITHUB_PATH"
+          ZIG_DIR="$RUNNER_TEMP/zig-0.16.0"
+          mkdir -p "$ZIG_DIR"
+          tar -xJf /tmp/zig.tar.xz -C "$ZIG_DIR" --strip-components=1
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
 
       - name: Build pristine pinned workspace fingerprint
         run: |
