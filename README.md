@@ -1,5 +1,3 @@
-# fx-companion
-
 <p align="center">
   <img src="media/fxc.svg" alt="fx-companion" width="120" />
 </p>
