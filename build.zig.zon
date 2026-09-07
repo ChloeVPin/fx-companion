@@ -10,7 +10,6 @@
         "benchmarks",
         "LICENSE",
         "README.md",
-        "PLAN.md",
         "com.chloevpin.fx-companiond.plist",
     },
     .dependencies = .{},
