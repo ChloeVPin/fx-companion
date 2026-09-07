@@ -31,9 +31,7 @@ jobs:
           set -euo pipefail
           URL="https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz"
           SHA256="b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
-          curl --fail --silent --show-error --location \
-            -A "OpenAI File Downloader, XaiImageApiFetch/1.0" \
-            "$URL" -o /tmp/zig.tar.xz
+          curl --fail --silent --show-error --location "$URL" -o /tmp/zig.tar.xz
           printf '%s  %s\n' "$SHA256" /tmp/zig.tar.xz | shasum -a 256 -c -
           ZIG_DIR="$RUNNER_TEMP/zig-0.16.0"
           mkdir -p "$ZIG_DIR"
@@ -50,7 +48,7 @@ jobs:
           echo "building against vercel-labs/fx@$COMMIT"
 
       - name: Clone upstream fx
-        run: git -c http.userAgent="OpenAI File Downloader, XaiImageApiFetch/1.0" clone https://github.com/vercel-labs/fx fx-src && git -C fx-src checkout "${{ steps.pin.outputs.commit }}"
+        run: git -c http.userAgent="fx-companion-release" clone https://github.com/vercel-labs/fx fx-src && git -C fx-src checkout "${{ steps.pin.outputs.commit }}"
 
       - name: Build pristine pinned workspace fingerprint
         run: |
@@ -61,7 +59,7 @@ jobs:
             zig build-exe src/fx_companion_workspace_dump.zig -lc -OReleaseFast -femit-bin=/tmp/workspace-dump-pristine
           )
 
-      - name: Inject booster
+      - name: Inject fx-companion
         run: |
           set -euo pipefail
           python3 product/inject_hook.py fx-src
@@ -119,7 +117,7 @@ jobs:
           const packs = require('/tmp/fxc-npm-pack.json');
           const files = new Set(packs[0].files.map((entry) => entry.path));
           for (const required of [
-            'cli.js', 'PINNED_FX', 'product/fx_companion.zig',
+            'cli.js', 'NOTICE', 'PINNED_FX', 'product/fx_companion.zig',
             'product/inject_hook.py', 'product/fxc',
             'product/tests_fxcompanion.zig', 'product/install.sh',
             'product/sync.sh',
@@ -211,10 +209,47 @@ jobs:
           /tmp/make-anchor "$BENCH_TREE/tree" 1024 100
           /tmp/benchmark-runner "$BENCH_TREE/tree" 2>&1 | tee /tmp/fxc-benchmark.txt
           grep -q 'correctness: PASS' /tmp/fxc-benchmark.txt
-          if grep -q 'boosted LOST' /tmp/fxc-benchmark.txt; then
-            echo 'boosted implementation lost the median comparison' >&2
+          if grep -q 'companion LOST' /tmp/fxc-benchmark.txt; then
+            echo 'fx-companion lost the median comparison' >&2
             exit 1
           fi
+          python3 - /tmp/fxc-benchmark.txt "${{ steps.pin.outputs.commit }}" "$GITHUB_SHA" > /tmp/BENCHMARK.json <<'PY'
+          import json
+          import re
+          import sys
+
+          text = open(sys.argv[1], encoding="utf-8").read()
+
+          def one(pattern):
+              match = re.search(pattern, text, re.MULTILINE)
+              if not match:
+                  raise SystemExit(f"missing benchmark field: {pattern}")
+              return match.group(1)
+
+          median = re.search(r"^median\s+([0-9.]+) ms\s+([0-9.]+) ms\s+([0-9.]+)x$", text, re.MULTILINE)
+          correctness = re.search(r"^correctness: PASS - .* paths=(\d+), path_bytes=(\d+), metadata matched$", text, re.MULTILINE)
+          if not median or not correctness:
+              raise SystemExit("could not parse release benchmark")
+
+          data = {
+              "schema": 1,
+              "companion_commit": sys.argv[3],
+              "upstream_fx_commit": sys.argv[2],
+              "runner": "github-actions-macos-15",
+              "workload": "1024 directories x 100 files",
+              "rounds": 7,
+              "candidate_cap": 600000,
+              "paths": int(correctness.group(1)),
+              "path_bytes": int(correctness.group(2)),
+              "stock_median_ms": float(median.group(1)),
+              "warm_median_ms": float(median.group(2)),
+              "warm_speedup": float(median.group(3)),
+              "correctness": "byte-identical",
+          }
+          json.dump(data, sys.stdout, indent=2, sort_keys=True)
+          sys.stdout.write("\n")
+          PY
+          cat /tmp/BENCHMARK.json
 
       - name: Package
         id: package
@@ -222,10 +257,11 @@ jobs:
           set -euo pipefail
           cp fx-src/zig-out/bin/fx fx
           chmod +x fx
+          cp /tmp/BENCHMARK.json BENCHMARK.json
           TAG="${GITHUB_REF_NAME:-dev}"
-          ASSET="fx-boosted-macos-arm64-${TAG}.tar.gz"
+          ASSET="fx-companion-macos-arm64-${TAG}.tar.gz"
           tar -czf "$ASSET" fx
-          shasum -a 256 "$ASSET" > SHA256SUMS
+          shasum -a 256 "$ASSET" LICENSE NOTICE BENCHMARK.json > SHA256SUMS
           {
             echo "fx-companion release provenance"
             echo "release_tag=$TAG"
@@ -235,6 +271,47 @@ jobs:
             echo "zig_archive_sha256=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
             echo "asset_sha256=$(awk '{print $1}' SHA256SUMS)"
           } > PROVENANCE.txt
+          {
+            echo "Make fx dramatically faster on Apple Silicon. Same fx. Same results. No fork."
+            echo
+            echo "## Highlights"
+            echo
+            echo "- Same upstream fx: built from the explicit PINNED_FX commit, not a replacement CLI."
+            echo "- Same results: pristine upstream and fx-companion discovery must match byte-for-byte before release."
+            echo "- Fail closed: unsupported or unprovable cases stay on the stock path."
+            echo
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "npx github:ChloeVPin/fx-companion#$TAG"
+            echo '```'
+            echo
+            echo "Supported target: macOS on Apple Silicon arm64. Existing unrelated fx executables are not moved or replaced."
+            echo
+            echo "## Release benchmark"
+            echo
+            echo "Generated CI workload, stock vs fx-companion. Full correctness gates run before packaging."
+            echo
+            echo '```text'
+            awk '/^median[[:space:]]/{print} /^best[[:space:]]/{print} /^correctness:/{print}' /tmp/fxc-benchmark.txt
+            echo '```'
+            echo
+            echo "The same measurement is attached as BENCHMARK.json."
+            echo
+            echo "## Safety"
+            echo
+            echo "- Set FX_NO_COMPANION=1 to force stock behavior."
+            echo "- Pristine pinned-upstream and injected discovery fingerprints must match for Git and recursive cold/warm paths."
+            echo "- SHA256SUMS is verified before publishing and release assets are never overwritten in place."
+            echo
+            echo "## Provenance"
+            echo
+            echo '```text'
+            cat PROVENANCE.txt
+            echo '```'
+            echo
+            echo "GitHub also records a build provenance attestation for the release tarball."
+          } > RELEASE_NOTES.md
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
@@ -252,7 +329,11 @@ jobs:
           path: |
             ${{ steps.package.outputs.asset }}
             SHA256SUMS
+            LICENSE
+            NOTICE
             PROVENANCE.txt
+            BENCHMARK.json
+            RELEASE_NOTES.md
 
   publish:
     needs: build
@@ -278,23 +359,28 @@ jobs:
           test "$TAG" = "$GITHUB_REF_NAME"
           test -f "release-assets/$ASSET"
           test -f release-assets/SHA256SUMS
+          test -f release-assets/LICENSE
+          test -f release-assets/NOTICE
           test -f release-assets/PROVENANCE.txt
+          test -f release-assets/BENCHMARK.json
+          test -f release-assets/RELEASE_NOTES.md
           (cd release-assets && shasum -a 256 -c SHA256SUMS)
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $TAG already exists; refusing to overwrite immutable assets" >&2
             exit 1
           fi
-          cp release-assets/PROVENANCE.txt /tmp/release-notes.txt
-          printf '\nBuild provenance is also recorded as a GitHub artifact attestation for the release tarball.\n' >> /tmp/release-notes.txt
           gh release create "$TAG" \
             -R "$GITHUB_REPOSITORY" \
             --verify-tag \
             --draft \
-            --title "$TAG - boosted fx (auto-built)" \
-            --notes-file /tmp/release-notes.txt
+            --title "fx-companion $TAG" \
+            --notes-file release-assets/RELEASE_NOTES.md
           gh release upload "$TAG" \
             "release-assets/$ASSET" \
             release-assets/SHA256SUMS \
+            release-assets/LICENSE \
+            release-assets/NOTICE \
             release-assets/PROVENANCE.txt \
+            release-assets/BENCHMARK.json \
             -R "$GITHUB_REPOSITORY"
           gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false

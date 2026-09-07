@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # One-command installer for fx-companion:
 #
-#   curl -fsSL https://raw.githubusercontent.com/ChloeVPin/fx-companion/v0.4.0/bootstrap.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/ChloeVPin/fx-companion/v0.4.1/bootstrap.sh | sh
 #
-# Fetches the booster payload and hands off to the real installer.
+# Fetches the fx-companion payload and hands off to the real installer.
 set -euo pipefail
 
 REPO="ChloeVPin/fx-companion"
-VERSION="0.4.0"
+VERSION="0.4.1"
 REF="v$VERSION"
 BASE="https://raw.githubusercontent.com/$REPO/$REF/product"
 ROOT_BASE="https://raw.githubusercontent.com/$REPO/$REF"
-USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
+USER_AGENT="fx-companion-bootstrap/$VERSION"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

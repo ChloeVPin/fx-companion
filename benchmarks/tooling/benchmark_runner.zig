@@ -1,4 +1,4 @@
-//! Standalone stock-vs-boosted workspace benchmark.
+//! Standalone stock-vs-companion workspace benchmark.
 const std = @import("std");
 const companion = @import("core/workspace/fx_companion.zig");
 const workspace_files = @import("core/workspace/workspace_files.zig");
@@ -70,9 +70,9 @@ pub fn run(root: []const u8) !void {
     if (!companion.active()) return error.CompanionInactive;
     defer workspace_files.companion_enabled = true;
     std.debug.print("\nfx-companion benchmark\ntree: {s}\n", .{root});
-    std.debug.print("method: isolated fx child; original stock code path vs boosted repeat path; 1 warmup + {d} rounds; alternating order\n", .{rounds});
-    std.debug.print("scope: forced recursive discovery, sorted output, cap={d}; traversal only (process startup and boosted cold fill excluded)\n\n", .{cap});
-    std.debug.print("             NON-BOOSTED (stock)       BOOSTED (fx-companion)\nround  first           time                     time        winner\n", .{});
+    std.debug.print("method: isolated fx child; original stock code path vs fx-companion repeat path; 1 warmup + {d} rounds; alternating order\n", .{rounds});
+    std.debug.print("scope: forced recursive discovery, sorted output, cap={d}; traversal only (process startup and companion cold fill excluded)\n\n", .{cap});
+    std.debug.print("             STOCK                     FX-COMPANION\nround  first           time                     time        winner\n", .{});
     _ = try runPair(root, true);
     var stock_times: [rounds]u64 = undefined;
     var boosted_times: [rounds]u64 = undefined;
@@ -85,14 +85,14 @@ pub fn run(root: []const u8) !void {
         boosted_times[i] = sample.boosted;
         paths = sample.paths;
         path_bytes = sample.bytes;
-        std.debug.print(" {d}     {s: <5}    {d: >10.3} ms          {d: >10.3} ms     {s}\n", .{ i + 1, if (stock_first) "stock" else "boost", ms(sample.stock), ms(sample.boosted), if (sample.boosted < sample.stock) "BOOSTED" else "STOCK" });
+        std.debug.print(" {d}     {s: <5}    {d: >10.3} ms          {d: >10.3} ms     {s}\n", .{ i + 1, if (stock_first) "stock" else "fxc", ms(sample.stock), ms(sample.boosted), if (sample.boosted < sample.stock) "FXC" else "STOCK" });
     }
     const stock_med = median(&stock_times);
     const boosted_med = median(&boosted_times);
     const speedup = @as(f64, @floatFromInt(stock_med)) / @as(f64, @floatFromInt(boosted_med));
     std.debug.print("\nmedian          {d: >10.3} ms          {d: >10.3} ms     {d:.2}x\nbest            {d: >10.3} ms          {d: >10.3} ms\n", .{ ms(stock_med), ms(boosted_med), speedup, ms(best(&stock_times)), ms(best(&boosted_times)) });
     std.debug.print("correctness: PASS - every stock/cold/warm result byte-identical; paths={d}, path_bytes={d}, metadata matched\n", .{ paths, path_bytes });
-    if (speedup < 1.0) std.debug.print("result: boosted LOST ({d:.2}x). This is reported as measured, not hidden.\n", .{speedup});
+    if (speedup < 1.0) std.debug.print("result: companion LOST ({d:.2}x). This is reported as measured, not hidden.\n", .{speedup});
     std.debug.print("\n", .{});
 }
 

@@ -1,0 +1,9 @@
+{"version":3,"term":{"cols":76,"rows":18},"timestamp":1788822013,"idle_time_limit":1.0,"command":"/tmp/fxc-demo-run.sh","env":{"SHELL":"/bin/zsh"}}
+[0.013, "o", "\u001b[2J\u001b[Hfxc\r\n\r\n$ stock fx vs fx-companion\r\n"]
+[0.000, "o", "workspace   51,200 files\r\nupstream    8d6152de1790\r\nmethod      same binary, same workspace, 7 alternating rounds\r\n\r\nmeasuring...\r\n"]
+[0.502, "o", "\u001b[1A\u001b[2K"]
+[0.012, "o", "stock fx    39.101 ms\r\nfxc cold    18.710 ms\r\nfxc warm    0.676 ms\r\n"]
+[0.000, "o", "result      byte-identical\r\n"]
+[0.000, "o", "speedup     57.824x warm\r\n\r\n"]
+[0.000, "o", "FX_NO_COMPANION=1 always restores stock behavior.\r\n"]
+[2.014, "x", "0"]

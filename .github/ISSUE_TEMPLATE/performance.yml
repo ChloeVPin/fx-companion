@@ -1,0 +1,52 @@
+name: Performance report
+description: Report a performance regression or a workload where fx-companion does not help
+title: "performance: "
+labels: [performance]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: fx-companion version
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware and software
+      description: Apple chip, core count, RAM, macOS version, and Zig version if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload
+      description: Describe Git vs recursive discovery, approximate file and directory counts, candidate cap, filesystem, and ignored paths that matter.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Benchmark command and output
+      description: Paste the exact command and complete relevant stock/cold/warm output.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Measurement conditions
+      description: Note power mode, thermal state, major background load, and whether measurements are medians across repeated runs.
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Correctness result
+      description: Include the correctness or equivalence line from the same run.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data check
+      options:
+        - label: I removed private repository contents, secrets, and identifying paths from benchmark output.
+          required: true

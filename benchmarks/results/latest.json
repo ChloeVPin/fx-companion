@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "measurement_date": "2026-09-07",
+  "product_version": "0.4.1",
+  "upstream_fx_commit": "8d6152de17905429ad78decdb475df8cfd04f557",
+  "hardware": {
+    "chip": "Apple M2",
+    "logical_cpus": 8,
+    "performance_cores": 4,
+    "memory_gib": 8,
+    "os": "macOS 27",
+    "zig": "0.16.0"
+  },
+  "production_discovery": [
+    {
+      "workload": "51,200-file synthetic tree",
+      "paths": 51200,
+      "candidate_cap": 600000,
+      "rounds": 7,
+      "stock_median_ms": 42.513,
+      "cold_median_ms": 19.059,
+      "warm_median_ms": 0.581,
+      "warm_speedup": 73.145,
+      "correctness": "byte-identical"
+    },
+    {
+      "workload": "/opt/homebrew",
+      "paths": 161771,
+      "candidate_cap": 600000,
+      "rounds": 7,
+      "stock_median_ms": 519.514,
+      "cold_median_ms": 305.942,
+      "warm_median_ms": 14.139,
+      "warm_speedup": 36.742,
+      "correctness": "byte-identical"
+    }
+  ],
+  "recorded_demo": {
+    "asset": "media/demo.cast",
+    "workload": "51,200-file synthetic tree",
+    "paths": 51200,
+    "rounds": 7,
+    "stock_median_ms": 39.101,
+    "cold_median_ms": 18.710,
+    "warm_median_ms": 0.676,
+    "warm_speedup": 57.824,
+    "correctness": "byte-identical"
+  },
+  "interactive_startup": [
+    {
+      "workload": "51,200-file synthetic tree",
+      "indexed_candidates": 51712,
+      "rounds": 7,
+      "stock_median_ms": 624.530,
+      "cold_median_ms": 624.927,
+      "warm_median_ms": 617.566,
+      "warm_speedup": 1.011,
+      "milestone": "process start to fx file index ready"
+    },
+    {
+      "workload": "409,600-file synthetic tree",
+      "indexed_candidates": 100000,
+      "rounds": 5,
+      "stock_median_ms": 951.448,
+      "cold_median_ms": 998.054,
+      "warm_median_ms": 907.892,
+      "warm_speedup": 1.048,
+      "milestone": "process start to fx file index ready"
+    }
+  ]
+}

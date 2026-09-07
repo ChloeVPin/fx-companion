@@ -42,6 +42,8 @@
 </head>
 <body>
 
+<p class="note"><strong>Historical R&amp;D only.</strong> This page describes an earlier architecture and upstream pin. It is not the current shipped product or the current public performance claim. See <code>benchmarks/README.md</code> for current results.</p>
+
 <h2>fx-companion vs base fx (pin 04e0ae0)</h2>
 <p class="sub">Apple silicon, macOS 27, warm cache, ReleaseFast, medians. Lower is better everywhere.</p>
 
@@ -103,9 +105,9 @@ stale-parent opens, unterminated path strings).
 <hr>
 
 <h2>3. Where we already beat fx outright</h2>
-<div class="row"><div class="label">IPC ping round trip</div><div class="barwrap"><div class="bar" style="width:2%;background:var(--accent)"></div></div><div class="val">15 us p50</div><div class="mult fast">&mdash;</div></div>
-<div class="row"><div class="label">daemon cold init</div><div class="barwrap"><div class="bar" style="width:11%;background:var(--accent)"></div></div><div class="val">412 us</div><div class="mult fast">&mdash;</div></div>
-<div class="row"><div class="label">daemon RSS idle</div><div class="barwrap"><div class="bar" style="width:12%;background:var(--accent)"></div></div><div class="val">1.8 MB</div><div class="mult fast">&mdash;</div></div>
+<div class="row"><div class="label">IPC ping round trip</div><div class="barwrap"><div class="bar" style="width:2%;background:var(--accent)"></div></div><div class="val">15 us p50</div><div class="mult fast">-</div></div>
+<div class="row"><div class="label">daemon cold init</div><div class="barwrap"><div class="bar" style="width:11%;background:var(--accent)"></div></div><div class="val">412 us</div><div class="mult fast">-</div></div>
+<div class="row"><div class="label">daemon RSS idle</div><div class="barwrap"><div class="bar" style="width:12%;background:var(--accent)"></div></div><div class="val">1.8 MB</div><div class="mult fast">-</div></div>
 <p class="note">Budget items, not speedups: all inside plan targets (&lt;5 ms cold start, &lt;15 MB RSS).</p>
 
 <hr>

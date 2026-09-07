@@ -1,0 +1,103 @@
+name: benchmark
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "23 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  production-discovery:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install verified Zig
+        run: |
+          set -euo pipefail
+          URL="https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz"
+          SHA256="b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+          curl --fail --silent --show-error --location "$URL" -o "$RUNNER_TEMP/zig.tar.xz"
+          printf '%s  %s\n' "$SHA256" "$RUNNER_TEMP/zig.tar.xz" | shasum -a 256 -c -
+          ZIG_DIR="$RUNNER_TEMP/zig-0.16.0"
+          mkdir -p "$ZIG_DIR"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$ZIG_DIR" --strip-components=1
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          export PATH="$ZIG_DIR:$PATH"
+          zig version
+
+      - name: Build exact pinned benchmark
+        run: |
+          set -euo pipefail
+          PIN="$(tr -d '[:space:]' < PINNED_FX)"
+          test "${#PIN}" -eq 40
+          git clone --filter=blob:none https://github.com/vercel-labs/fx "$RUNNER_TEMP/fx-src"
+          git -C "$RUNNER_TEMP/fx-src" checkout "$PIN"
+          python3 product/inject_hook.py "$RUNNER_TEMP/fx-src"
+          cp benchmarks/discover_bench.zig "$RUNNER_TEMP/fx-src/src/fx_companion_discover_bench.zig"
+          (
+            cd "$RUNNER_TEMP/fx-src"
+            zig build-exe src/fx_companion_discover_bench.zig -lc -OReleaseFast -femit-bin="$RUNNER_TEMP/discover-bench"
+          )
+          zig build-exe benchmarks/make_anchor.zig -lc -OReleaseFast -femit-bin="$RUNNER_TEMP/make-anchor"
+
+      - name: Measure production discovery
+        run: |
+          set -euo pipefail
+          TREE="$RUNNER_TEMP/benchmark-tree"
+          "$RUNNER_TEMP/make-anchor" "$TREE" 512 100
+          "$RUNNER_TEMP/discover-bench" "$TREE" 5 600000 2>&1 | tee "$RUNNER_TEMP/benchmark.txt"
+          grep -q '^correctness=byte-identical paths=51200 ' "$RUNNER_TEMP/benchmark.txt"
+
+          python3 - "$RUNNER_TEMP/benchmark.txt" "$(tr -d '[:space:]' < PINNED_FX)" "$GITHUB_SHA" > "$RUNNER_TEMP/benchmark.json" <<'PY'
+          import json
+          import re
+          import sys
+
+          text = open(sys.argv[1], encoding="utf-8").read()
+
+          def one(pattern):
+              match = re.search(pattern, text, re.MULTILINE)
+              if not match:
+                  raise SystemExit(f"missing benchmark field: {pattern}")
+              return match.group(1)
+
+          data = {
+              "schema": 1,
+              "companion_commit": sys.argv[3],
+              "upstream_fx_commit": sys.argv[2],
+              "runner": "github-actions-macos-15",
+              "workload": "512 directories x 100 files",
+              "rounds": 5,
+              "candidate_cap": 600000,
+              "paths": int(one(r"^correctness=byte-identical paths=(\d+)")),
+              "stock_median_ms": float(one(r"^stock\s+median=([0-9.]+) ms")),
+              "cold_median_ms": float(one(r"^cold\s+median=([0-9.]+) ms")),
+              "warm_median_ms": float(one(r"^warm\s+median=([0-9.]+) ms")),
+              "warm_speedup": float(one(r"^speedup=([0-9.]+)x")),
+              "correctness": "byte-identical",
+          }
+          json.dump(data, sys.stdout, indent=2, sort_keys=True)
+          sys.stdout.write("\n")
+          PY
+
+          cat "$RUNNER_TEMP/benchmark.json"
+
+      - name: Publish benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-discovery-benchmark-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}/benchmark.json
+            ${{ runner.temp }}/benchmark.txt

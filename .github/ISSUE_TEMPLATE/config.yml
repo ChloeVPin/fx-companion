@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Upstream fx issues
+    url: https://github.com/vercel-labs/fx/issues
+    about: Use upstream fx for issues that reproduce unchanged with FX_NO_COMPANION=1 and are not caused by fx-companion.
+  - name: Security report
+    url: https://github.com/ChloeVPin/fx-companion/security/advisories/new
+    about: Report security-sensitive problems privately when GitHub private vulnerability reporting is available.

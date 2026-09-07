@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-29 -790 1717 882" role="img" aria-labelledby="title">
+  <title id="title">fxc</title>
+  <style>
+    .mark { fill: #000; }
+    @media (prefers-color-scheme: dark) { .mark { fill: #fff; } }
+  </style>
+  <g class="mark">
+  <path d="M127 0V435H51V534H127V555Q127 627 167.0 668.5Q207 710 291 710H395V611H315Q255 611 255 548V534H388V435H255V0Z" transform="translate(0 0) scale(1 -1)"/>
+  <path d="M46 0 238 272 53 534H192L314 352L434 534H575L391 271L582 0H443L316 192L188 0Z" transform="translate(429 0) scale(1 -1)"/>
+  <path d="M302 -12Q222 -12 163.0 22.5Q104 57 71.5 120.0Q39 183 39 267Q39 351 71.5 414.0Q104 477 163.0 511.5Q222 546 302 546Q404 546 471.5 493.0Q539 440 551 345L419 338Q411 389 379.5 415.5Q348 442 302 442Q240 442 206.0 396.0Q172 350 172 267Q172 184 206.0 138.0Q240 92 302 92Q349 92 380.5 119.0Q412 146 419 203L551 197Q540 101 472.5 44.5Q405 -12 302 -12Z" transform="translate(1057 0) scale(1 -1)"/>
+  </g>
+</svg>

@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * fx-companion - boosted fx for Apple Silicon.
+ * fx-companion - workspace discovery accelerator for fx on Apple Silicon.
  *
  *   npx github:ChloeVPin/fx-companion            install (default)
  *   npx github:ChloeVPin/fx-companion status     check what's installed
  *
- * Downloads the matching prebuilt boosted fx binary from GitHub Releases when
+ * Downloads the matching prebuilt fx-companion binary from GitHub Releases when
  * available. If no compatible release exists yet, it builds from the exact
  * source bundle shipped with this package. It never executes source fetched
  * from a mutable branch.
@@ -20,12 +20,12 @@ const os = require('node:os');
 
 const PKG_VERSION = require('./package.json').version;
 const REPO = 'ChloeVPin/fx-companion';
-const USER_AGENT = 'OpenAI File Downloader, XaiImageApiFetch/1.0';
+const USER_AGENT = `fx-companion/${PKG_VERSION}`;
 const API = process.env.FXC_API_ROOT || `https://api.github.com/repos/${REPO}`;
 const INSTALL_HOME = process.env.FX_COMPANION_HOME || path.join(os.homedir(), '.fx-companion');
 const INSTALL_DIR = path.join(INSTALL_HOME, 'bin');
 const RELEASE_TAG = `v${PKG_VERSION}`;
-const RELEASE_ASSET = `fx-boosted-macos-arm64-${RELEASE_TAG}.tar.gz`;
+const RELEASE_ASSET = `fx-companion-macos-arm64-${RELEASE_TAG}.tar.gz`;
 
 const SOURCE_FILES = [
   'PINNED_FX',
@@ -84,7 +84,7 @@ function installManagerBundle() {
   for (const entry of MANAGER_FILES) {
     atomicCopyFile(packagedSourcePath(entry.relative), entry.destination, entry.executable ? 0o755 : null);
   }
-  console.log(`✓ installed manager bundle in ${INSTALL_HOME}`);
+  console.log(`installed manager bundle in ${INSTALL_HOME}`);
 }
 
 async function api(pathName) {
@@ -130,10 +130,10 @@ async function download(url, dest) {
 
 async function installRelease(rel, tmp) {
   const tgz = path.join(tmp, 'fx.tar.gz');
-  process.stdout.write('↓ downloading prebuilt binary…\n');
+  process.stdout.write('downloading prebuilt binary...\n');
   const buf = await download(rel.assetUrl, tgz);
 
-  process.stdout.write('🔒 verifying checksum…\n');
+  process.stdout.write('verifying checksum...\n');
   if (!rel.sumsUrl) throw new Error(`release ${rel.tag} has no SHA256SUMS; refusing an unverified install`);
   let sumsResponse;
   try {
@@ -153,7 +153,7 @@ async function installRelease(rel, tmp) {
   const expected = matches[0];
   const actual = crypto.createHash('sha256').update(buf).digest('hex');
   if (expected !== actual) throw new Error(`checksum mismatch!\n  expected ${expected}\n  actual   ${actual}`);
-  console.log('✓ checksum ok');
+  console.log('checksum ok');
 
   const listing = sh('tar', ['-tzf', tgz], { capture: true });
   if (listing.status !== 0) throw new Error('could not inspect release archive');
@@ -163,7 +163,7 @@ async function installRelease(rel, tmp) {
   const extracted = path.join(tmp, 'fx');
   const tar = sh('tar', ['-xzf', tgz, '-C', tmp, 'fx']);
   if (tar.status !== 0 || !fs.existsSync(extracted) || !fs.lstatSync(extracted).isFile()) throw new Error('archive did not contain a regular fx binary');
-  if (!hasBooster(fs.readFileSync(extracted))) throw new Error('binary failed the booster integrity check; refusing to install');
+  if (!hasBooster(fs.readFileSync(extracted))) throw new Error('binary failed the fx-companion integrity check; refusing to install');
   installManagerBundle();
   installBinary(extracted);
 }
@@ -193,7 +193,7 @@ async function installFromSource(tmp) {
   if (result.status !== 0) throw new Error(`pinned source build failed with exit ${result.status ?? 'signal'}`);
   if (!fs.existsSync(path.join(INSTALL_DIR, 'fx'))) throw new Error('pinned source build produced no fx binary');
   activateOnPath();
-  console.log(`✓ installed pinned source build from packaged sources`);
+  console.log('installed pinned source build from packaged sources');
 }
 
 function installBinary(built) {
@@ -216,12 +216,12 @@ function installBinary(built) {
   } finally {
     fs.rmSync(staged, { force: true });
   }
-  console.log(`✓ installed ${INSTALL_DIR}/fx`);
+  console.log(`installed ${INSTALL_DIR}/fx`);
   activateOnPath();
 }
 
 function hasBooster(buf) {
-  // The kill-switch env name is compiled into every boosted binary.
+  // The kill-switch env name is compiled into every fx-companion binary.
   return buf.includes(Buffer.from('FX_NO_COMPANION', 'ascii'));
 }
 
@@ -230,7 +230,7 @@ async function install() {
     err(`this package boosts fx on macOS Apple Silicon only (you have ${process.platform}/${process.arch}).`);
   }
 
-  console.log(`fx-companion v${PKG_VERSION} - installing boosted fx…`);
+  console.log(`fx-companion v${PKG_VERSION} - installing accelerated fx...`);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fxc-'));
   try {
     const rel = await resolveRelease();
@@ -252,7 +252,7 @@ async function install() {
   }
   console.log('');
   console.log('Then just run `fx` - same commands, same output, faster.');
-  console.log('Stock anytime: FX_NO_COMPANION=1 fx …   ·   Sessions/skills/data untouched.');
+  console.log('Stock anytime: FX_NO_COMPANION=1 fx. Sessions, skills, and data stay untouched.');
   console.log('Diagnostics stay outside fx; use the repository benchmark tooling when profiling.');
 }
 
@@ -278,7 +278,7 @@ function activateOnPath() {
         if (lst.isSymbolicLink()) {
           const resolved = fs.realpathSync(link);
           if (resolved === ours) {
-            console.log(`✓ ${link} → boosted fx (already active)`);
+            console.log(`${link} -> fx-companion (already active)`);
             return;
           }
           if (!fs.existsSync(resolved)) {
@@ -291,7 +291,7 @@ function activateOnPath() {
         }
       }
       fs.symlinkSync(ours, link);
-      console.log(`✓ linked ${link} → boosted fx (already on your PATH)`);
+      console.log(`linked ${link} -> fx-companion (already on your PATH)`);
       return;
     } catch {}
   }
@@ -305,9 +305,9 @@ function activateOnPath() {
     if (!cur.includes(begin)) {
       const block = `\n${begin}\nexport PATH="${INSTALL_DIR}:$PATH"\n${end}\n`;
       fs.appendFileSync(zshrc, block);
-      console.log(`✓ added ${INSTALL_DIR} to your ~/.zshrc (open a new tab to pick it up)`);
+      console.log(`added ${INSTALL_DIR} to your ~/.zshrc (open a new tab to pick it up)`);
     } else {
-      console.log('✓ ~/.zshrc already activates fx-companion');
+      console.log('~/.zshrc already activates fx-companion');
     }
   } catch {
     console.log(`add to your ~/.zshrc:  export PATH="${INSTALL_DIR}:$PATH"`);
@@ -316,7 +316,7 @@ function activateOnPath() {
 
 function status() {
   const bin = path.join(INSTALL_DIR, 'fx');
-  if (!fs.existsSync(bin)) return console.log('boosted fx: not installed (run without arguments to install)');
+  if (!fs.existsSync(bin)) return console.log(`fx-companion v${PKG_VERSION}: not installed`);
   const v = sh(bin, ['--version'], { capture: true });
   const hasBoosterFlag = (() => {
     try {
@@ -326,9 +326,17 @@ function status() {
       return '?';
     }
   })();
-  console.log(`${bin} → v${(v.stdout || '').trim()} · booster: ${hasBoosterFlag ? 'PRESENT ✦' : 'absent'}`);
+  console.log(`fx-companion: v${PKG_VERSION}`);
+  console.log(`managed fx: ${bin}`);
+  console.log(`upstream fx: v${(v.stdout || '').trim()}`);
+  console.log(`accelerator: ${hasBoosterFlag ? 'present' : 'absent'}`);
+  try {
+    const pin = fs.readFileSync(path.join(INSTALL_HOME, 'PINNED_FX'), 'utf8').trim();
+    if (pin) console.log(`upstream pin: ${pin}`);
+  } catch {}
   const w = sh('which', ['fx'], { capture: true });
-  console.log(`which fx → ${(w.stdout || '').trim() || '(not on PATH)'}`);
+  console.log(`active fx: ${(w.stdout || '').trim() || '(not on PATH)'}`);
+  console.log('stock mode: FX_NO_COMPANION=1 fx');
 }
 
 (async () => {

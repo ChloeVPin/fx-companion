@@ -1,0 +1,55 @@
+name: Upstream compatibility
+description: Report a new Vercel fx commit that changes or breaks an injection seam
+title: "upstream: "
+labels: [upstream-compatibility]
+body:
+  - type: input
+    id: current_pin
+    attributes:
+      label: Current PINNED_FX commit
+    validations:
+      required: true
+  - type: input
+    id: upstream_commit
+    attributes:
+      label: Upstream fx commit tested
+      placeholder: "40-character commit"
+    validations:
+      required: true
+  - type: dropdown
+    id: method
+    attributes:
+      label: How did you test it?
+      options:
+        - fxc sync --latest
+        - manual injector run
+        - CI or branch experiment
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: injection
+    attributes:
+      label: Injector or build output
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: seam
+    attributes:
+      label: Suspected upstream change
+      description: Identify the function, file, or behavior that changed. Link upstream commits or pull requests when useful.
+    validations:
+      required: true
+  - type: textarea
+    id: equivalence
+    attributes:
+      label: Differential result
+      description: Include pristine vs injected results if the injected tree still builds.
+  - type: textarea
+    id: fail_closed
+    attributes:
+      label: Fail-closed behavior
+      description: Explain whether the existing installed binary remained usable and whether the attempted update was refused safely.
+    validations:
+      required: true

@@ -1,7 +1,12 @@
 {
   "name": "fx-companion",
-  "version": "0.4.0",
-  "description": "Unofficial Apple Silicon accelerator for fx. Caches git ls-files and sorted walks. Stock-identical output.",
+  "version": "0.4.1",
+  "description": "Make Vercel Labs fx faster on Apple Silicon with byte-identical, fail-closed workspace discovery.",
+  "homepage": "https://github.com/ChloeVPin/fx-companion#readme",
+  "bugs": {
+    "url": "https://github.com/ChloeVPin/fx-companion/issues"
+  },
+  "author": "ChloeVPin",
   "license": "Apache-2.0",
   "bin": {
     "fx-companion": "cli.js"
@@ -10,13 +15,27 @@
   "engines": {
     "node": ">=18"
   },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "scripts": {
+    "check": "node --check cli.js && node --check product/cli_smoke_test.js",
+    "test": "node product/cli_smoke_test.js"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ChloeVPin/fx-companion.git"
   },
-  "keywords": ["fx", "apple-silicon", "macos", "zig", "cli", "git"],
+  "keywords": ["fx", "vercel-fx", "apple-silicon", "macos", "arm64", "performance", "zig", "cli", "git"],
   "files": [
     "cli.js",
+    "NOTICE",
+    "media/fxc.svg",
+    "media/demo.gif",
+    "media/benchmark.png",
     "PINNED_FX",
     "product/fx_companion.zig",
     "product/inject_hook.py",

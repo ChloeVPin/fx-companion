@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# fxc - fx-companion booster manager.
+# fxc - fx-companion manager.
 #   fxc sync           rebuild from PINNED_FX
 #   fxc sync --latest  probe origin/main; advance the pin only if gates pass
-#   fxc status         show whether the running fx binary carries the booster
+#   fxc status         show whether the running fx binary carries fx-companion
 set -euo pipefail
 
 FXC_HOME="${FX_COMPANION_HOME:-$HOME/.fx-companion}"
@@ -21,9 +21,9 @@ case "$cmd" in
     [ -n "$bin" ] || die "no fx on PATH"
     echo "fx binary: $bin"
     if strings "$bin" 2>/dev/null | grep -c "FX_NO_COMPANION" | grep -qv '^0$'; then
-      echo "booster: PRESENT"
+      echo "accelerator: present"
     else
-      echo "booster: absent (stock fx)"
+      echo "accelerator: absent (stock fx)"
     fi
     if [ -f "$FXC_HOME/PINNED_FX" ]; then
       echo "pin: $(tr -d '[:space:]' < "$FXC_HOME/PINNED_FX")"

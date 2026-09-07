@@ -26,6 +26,29 @@ jobs:
           node --check product/cli_smoke_test.js
           bash -n product/install.sh
           bash -n product/sync.sh
+          python3 -m json.tool benchmarks/results/latest.json >/dev/null
+          test -s media/fxc.svg
+          test -s media/demo.cast
+          test -s media/demo.gif
+          test -s media/benchmark.png
+          test -s media/social-preview.png
+          python3 - <<'PY'
+          from pathlib import Path
+
+          forbidden = (chr(0x2014), "&" + "mdash;", "&#" + "8212;")
+          hits = []
+          for path in Path(".").rglob("*"):
+              if not path.is_file() or ".git" in path.parts:
+                  continue
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+              if any(token in text for token in forbidden):
+                  hits.append(str(path))
+          if hits:
+              raise SystemExit("em dash punctuation found in: " + ", ".join(hits))
+          PY
 
       - name: Package contains immutable source fallback bundle
         run: |
@@ -35,7 +58,7 @@ jobs:
           const packs = require('/tmp/fxc-npm-pack.json');
           const files = new Set(packs[0].files.map((entry) => entry.path));
           for (const required of [
-            'cli.js', 'PINNED_FX', 'product/fx_companion.zig',
+            'cli.js', 'NOTICE', 'PINNED_FX', 'product/fx_companion.zig',
             'product/inject_hook.py', 'product/fxc',
             'product/tests_fxcompanion.zig', 'product/install.sh',
             'product/sync.sh',
@@ -79,7 +102,7 @@ jobs:
             zig build-exe src/fx_companion_workspace_dump.zig -lc -OReleaseFast -femit-bin=/tmp/workspace-dump-pristine
           )
 
-      - name: Inject booster and build injected differential probes
+      - name: Inject fx-companion and build differential probes
         run: |
           set -euo pipefail
           python3 product/inject_hook.py fx-src

@@ -1,0 +1,46 @@
+class FxCompanion < Formula
+  desc "Apple Silicon workspace discovery accelerator for Vercel Labs fx"
+  homepage "https://github.com/ChloeVPin/fx-companion"
+  url "https://github.com/ChloeVPin/fx-companion/releases/download/v@VERSION@/fx-companion-macos-arm64-v@VERSION@.tar.gz"
+  sha256 "@ASSET_SHA256@"
+  license "Apache-2.0"
+
+  depends_on :macos
+  depends_on arch: :arm64
+
+  keg_only "it provides an fx binary and must not replace or shadow another fx installation"
+
+  def install
+    libexec.install "fx" => "fx.real"
+
+    (bin/"fx").write <<~SH
+      #!/bin/sh
+      set -eu
+      if [ "${1:-}" = "upgrade" ]; then
+        echo "fx-companion is managed by Homebrew. Run: brew upgrade fx-companion" >&2
+        exit 0
+      fi
+      exec "#{libexec}/fx.real" "$@"
+    SH
+  end
+
+  def caveats
+    <<~EOS
+      fx-companion is keg-only so Homebrew will not replace an existing fx.
+
+      To opt in explicitly, put this keg before your existing fx on PATH:
+        export PATH="#{opt_bin}:$PATH"
+
+      Stock behavior remains available at any time:
+        FX_NO_COMPANION=1 fx
+
+      The wrapper keeps `fx upgrade` inside Homebrew's package-management model.
+      Use `brew upgrade fx-companion` to update this installation.
+    EOS
+  end
+
+  test do
+    assert_match(/\A\d+\.\d+\.\d+\z/, shell_output("#{bin}/fx --version").strip)
+    assert_match "FX_NO_COMPANION", shell_output("strings #{libexec}/fx.real")
+  end
+end

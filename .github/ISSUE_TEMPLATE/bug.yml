@@ -1,0 +1,79 @@
+name: Bug report
+description: Report incorrect behavior, installation problems, crashes, or regressions
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please remove secrets and private repository data from logs or reproductions.
+  - type: input
+    id: version
+    attributes:
+      label: fx-companion version
+      placeholder: "0.4.1"
+    validations:
+      required: true
+  - type: input
+    id: upstream
+    attributes:
+      label: Pinned upstream fx commit
+      description: Run `cat ~/.fx-companion/PINNED_FX` if installed.
+      placeholder: "40-character commit"
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation method
+      options:
+        - npx from GitHub
+        - source bootstrap
+        - release archive
+        - other
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: Apple chip, macOS version, Node.js version, and Zig version if source-built.
+      placeholder: "Apple M2, macOS 27.x, Node 22.x, Zig 0.16.0"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe sequence that reproduces the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: stock
+    attributes:
+      label: Stock comparison
+      description: Does the problem reproduce with `FX_NO_COMPANION=1`? Include relevant output.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Include `fx-companion status` or `~/.fx-companion/fxc status` output when relevant. Remove sensitive paths or data.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, private repository contents, and other sensitive data from this report.
+          required: true

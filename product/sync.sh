@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild boosted fx from a pinned vercel-labs/fx commit.
+# Rebuild fx-companion from a pinned vercel-labs/fx commit.
 # Does not replace the installed binary until inject + equivalence pass.
 # If the required seam is gone, keep the last known-good binary.
 set -euo pipefail
@@ -13,7 +13,7 @@ else
   PIN_FILE="${FX_PIN_FILE:-$FXC_HOME/PINNED_FX}"
 fi
 TRY_LATEST="${1:-}"
-GIT_HTTP_USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
+GIT_HTTP_USER_AGENT="fx-companion-sync"
 
 command -v zig >/dev/null || { echo "sync: zig is required" >&2; exit 1; }
 command -v git >/dev/null || { echo "sync: git is required" >&2; exit 1; }
@@ -100,14 +100,14 @@ git -C "$UPSTREAM" checkout --force "$TARGET" >/dev/null
 git -C "$UPSTREAM" reset --hard "$TARGET" >/dev/null
 git -C "$UPSTREAM" clean -fdx >/dev/null
 
-echo "sync: injecting booster into $TARGET"
+echo "sync: injecting fx-companion into $TARGET"
 if ! python3 "$HERE/inject_hook.py" "$UPSTREAM"; then
   echo "sync: required seam missing on $TARGET - keeping last known-good binary" >&2
   if [ -x "$FXC_HOME/bin/fx" ]; then
     echo "sync: still installed $FXC_HOME/bin/fx"
     exit 1
   fi
-  echo "sync: no previous boosted binary to keep" >&2
+  echo "sync: no previous fx-companion binary to keep" >&2
   exit 1
 fi
 
@@ -120,7 +120,7 @@ if [ ! -x "$NEW_BIN" ]; then
   exit 1
 fi
 if ! grep -q FX_NO_COMPANION "$NEW_BIN"; then
-  echo "sync: booster marker missing; refusing to install" >&2
+  echo "sync: fx-companion marker missing; refusing to install" >&2
   exit 1
 fi
 
@@ -184,5 +184,5 @@ if [ "$TRY_LATEST" = "--latest" ] && [ "$TARGET" != "$PIN" ]; then
 fi
 
 echo "sync: installed $FXC_HOME/bin/fx"
-echo "After stock \`fx upgrade\`, re-run this sync to reattach the booster."
+echo "After stock \`fx upgrade\`, re-run this sync to reattach fx-companion."
 echo "Stock anytime: FX_NO_COMPANION=1 fx ..."
