@@ -1,4 +1,4 @@
-# 2026-08-26 — Apple M2 / macOS 27
+# 2026-08-26 - Apple M2 / macOS 27
 
 Environment: Apple M2 (8 cores), 8 GiB RAM, macOS 27.0, Darwin 27.0.0 arm64,
 Zig 0.16.0. Pinned fx: `8d6152de17905429ad78decdb475df8cfd04f557`.

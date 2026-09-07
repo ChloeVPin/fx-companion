@@ -1,4 +1,4 @@
-# 2026-09-07 — Adaptive traversal policy
+# 2026-09-07 - Adaptive traversal policy
 
 Hardware: Apple M2, 8 logical CPUs (4 performance + 4 efficiency), macOS arm64.
 Pinned fx: `8d6152de17905429ad78decdb475df8cfd04f557`.

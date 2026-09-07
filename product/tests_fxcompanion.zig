@@ -207,7 +207,7 @@ fn verifyGitIdentityMutations() !void {
     const extra_cmd = try std.fmt.bufPrintZ(&cmd_buf, "printf 'u\\n' > {s}/untracked.txt", .{path});
     try runShell(extra_cmd);
     // Default discover stays the tracked snapshot (1 path). Untracked modes must
-    // exec git, not serve that snapshot — stock/boosted counts would diverge.
+    // exec git, not serve that snapshot - stock/boosted counts would diverge.
     const after_untracked_file = try compareFiles(path, options, "files/git-id-after-untracked-file");
     if (!after_untracked_file.hit) return error.GitCacheMissAfterUntrackedFile;
     _ = try compareFiles(path, .{

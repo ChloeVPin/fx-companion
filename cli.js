@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * fx-companion — boosted fx for Apple Silicon.
+ * fx-companion - boosted fx for Apple Silicon.
  *
  *   npx github:ChloeVPin/fx-companion            install (default)
  *   npx github:ChloeVPin/fx-companion status     check what's installed
@@ -230,7 +230,7 @@ async function install() {
     err(`this package boosts fx on macOS Apple Silicon only (you have ${process.platform}/${process.arch}).`);
   }
 
-  console.log(`fx-companion v${PKG_VERSION} — installing boosted fx…`);
+  console.log(`fx-companion v${PKG_VERSION} - installing boosted fx…`);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fxc-'));
   try {
     const rel = await resolveRelease();
@@ -251,7 +251,7 @@ async function install() {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
   console.log('');
-  console.log('Then just run `fx` — same commands, same output, faster.');
+  console.log('Then just run `fx` - same commands, same output, faster.');
   console.log('Stock anytime: FX_NO_COMPANION=1 fx …   ·   Sessions/skills/data untouched.');
   console.log('Diagnostics stay outside fx; use the repository benchmark tooling when profiling.');
 }

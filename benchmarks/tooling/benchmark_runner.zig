@@ -91,7 +91,7 @@ pub fn run(root: []const u8) !void {
     const boosted_med = median(&boosted_times);
     const speedup = @as(f64, @floatFromInt(stock_med)) / @as(f64, @floatFromInt(boosted_med));
     std.debug.print("\nmedian          {d: >10.3} ms          {d: >10.3} ms     {d:.2}x\nbest            {d: >10.3} ms          {d: >10.3} ms\n", .{ ms(stock_med), ms(boosted_med), speedup, ms(best(&stock_times)), ms(best(&boosted_times)) });
-    std.debug.print("correctness: PASS — every stock/cold/warm result byte-identical; paths={d}, path_bytes={d}, metadata matched\n", .{ paths, path_bytes });
+    std.debug.print("correctness: PASS - every stock/cold/warm result byte-identical; paths={d}, path_bytes={d}, metadata matched\n", .{ paths, path_bytes });
     if (speedup < 1.0) std.debug.print("result: boosted LOST ({d:.2}x). This is reported as measured, not hidden.\n", .{speedup});
     std.debug.print("\n", .{});
 }

@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const sorted_git2 = try sampleDiscover(root, .{ .sort_paths = true });
     printSample("prod/sorted-2", sorted_git2, true, false, cap);
 
-    // Recursive fallback — the path our benches measure.
+    // Recursive fallback - the path our benches measure.
     companion.clearSnapshotCache();
     const rec1 = try sampleDiscover(root, .{ .force_fallback = true, .sort_paths = true });
     printSample("fallback/sorted-cold", rec1, true, true, cap);

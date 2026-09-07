@@ -4,7 +4,7 @@ Copyright 2026 ChloeVPin
 This product accelerates vercel-labs/fx ("fx") and distributes an additive
 build of it. fx is developed and owned by Vercel Labs:
 
-  fx — https://github.com/vercel-labs/fx
+  fx - https://github.com/vercel-labs/fx
   Copyright Vercel Labs, Inc.
 
 Both codebases are licensed under the Apache License, Version 2.0 (the

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fx-companion installer: one command, then `fx` just works — stock output,
+# fx-companion installer: one command, then `fx` just works - stock output,
 # boosted speed. Stock behavior anytime with FX_NO_COMPANION=1.
 #
 # Builds pinned vercel-labs/fx with the additive booster. Never reads or

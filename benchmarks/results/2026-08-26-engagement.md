@@ -1,4 +1,4 @@
-# 2026-08-26 — Production-path engagement
+# 2026-08-26 - Production-path engagement
 
 Environment: Apple M2, macOS 27.0, Darwin 27.0.0 arm64, Zig 0.16.0.
 Pinned fx: `8d6152de17905429ad78decdb475df8cfd04f557`.
@@ -14,7 +14,7 @@ zig build-exe src/fx_companion_engagement.zig -lc -OReleaseFast -femit-bin=/tmp/
 /tmp/engagement-probe /path/to/tree
 ```
 
-## Phase 1 — before git-list cache
+## Phase 1 - before git-list cache
 
 Companion hooked only sorted recursive `walkWorkspacePaths`. Production
 `discover()` uses `git ls-files` first.
@@ -26,13 +26,13 @@ Companion hooked only sorted recursive `walkWorkspacePaths`. Production
 | /opt/homebrew | yes | source=git 9–13 ms | skipped:git-primary (100%) | 3130 tracked files |
 
 Recursive `force_fallback+sorted` on this repo was 0.52 ms cold / 0.027 ms warm
-— faster than git, but production never takes that path in a git workspace.
+- faster than git, but production never takes that path in a git workspace.
 `/opt/homebrew` recursive fallback truncated at 100k in 1279 ms; git listed
 the real 3130 files in 13 ms. Git is the correct live path.
 
 No grep or model timings. Discovery on these git trees is 9–21 ms, not 2 ms.
 
-## Phase 2 — git ls-files snapshot
+## Phase 2 - git ls-files snapshot
 
 Additive cache: exec git on miss; snapshot parsed paths keyed by
 `.git` directory / `HEAD` / `index` stamps. `--others` / untracked modes

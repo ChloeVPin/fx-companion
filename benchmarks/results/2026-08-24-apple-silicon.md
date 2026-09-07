@@ -1,4 +1,4 @@
-# 2026-08-24 — Apple M2 / macOS 27
+# 2026-08-24 - Apple M2 / macOS 27
 
 Environment: Apple M2 (8 cores), 8 GiB RAM, macOS 27.0 (26A5416b), arm64,
 Zig 0.16.0. Pinned fx: `669ef8a7f0bf6b13a1722bfd434fb9fc61d01511`.
@@ -110,7 +110,7 @@ round  first    stock ms   boosted ms
 7      stock      90.567        1.205
 median            80.894        1.136   71.24x
 best              79.416        0.859
-correctness: PASS — paths=100000, path_bytes=1000000, metadata matched
+correctness: PASS - paths=100000, path_bytes=1000000, metadata matched
 ```
 
 This is a warm unchanged-tree repeat-discovery result, not a cold traversal

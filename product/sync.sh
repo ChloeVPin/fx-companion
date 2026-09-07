@@ -102,7 +102,7 @@ git -C "$UPSTREAM" clean -fdx >/dev/null
 
 echo "sync: injecting booster into $TARGET"
 if ! python3 "$HERE/inject_hook.py" "$UPSTREAM"; then
-  echo "sync: required seam missing on $TARGET — keeping last known-good binary" >&2
+  echo "sync: required seam missing on $TARGET - keeping last known-good binary" >&2
   if [ -x "$FXC_HOME/bin/fx" ]; then
     echo "sync: still installed $FXC_HOME/bin/fx"
     exit 1
@@ -136,7 +136,7 @@ ln -sfn src "$TINY/dirlink"
 (cd "$UPSTREAM" && zig build-exe src/tests_fxcompanion.zig -lc -OReleaseFast -femit-bin=/tmp/fxc_equiv_selftest)
 OUT="$(/tmp/fxc_equiv_selftest "$TINY" 2>&1 || true)"
 if [ "$(echo "$OUT" | grep -c IDENTICAL)" -lt 2 ]; then
-  echo "sync: SELF-TEST FAILED — keeping last known-good binary" >&2
+  echo "sync: SELF-TEST FAILED - keeping last known-good binary" >&2
   echo "$OUT" >&2
   exit 1
 fi

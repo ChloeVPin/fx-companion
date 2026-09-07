@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fxc — fx-companion booster manager.
+# fxc - fx-companion booster manager.
 #   fxc sync           rebuild from PINNED_FX
 #   fxc sync --latest  probe origin/main; advance the pin only if gates pass
 #   fxc status         show whether the running fx binary carries the booster

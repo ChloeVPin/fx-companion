@@ -290,7 +290,7 @@ jobs:
             -R "$GITHUB_REPOSITORY" \
             --verify-tag \
             --draft \
-            --title "$TAG — boosted fx (auto-built)" \
+            --title "$TAG - boosted fx (auto-built)" \
             --notes-file /tmp/release-notes.txt
           gh release upload "$TAG" \
             "release-assets/$ASSET" \

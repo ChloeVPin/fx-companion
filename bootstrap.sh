@@ -17,7 +17,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 command -v curl >/dev/null || { echo "bootstrap: curl is required"; exit 1; }
 command -v zig >/dev/null || {
-  echo "bootstrap: zig is required — install it first:  brew install zig"
+  echo "bootstrap: zig is required - install it first:  brew install zig"
   exit 1
 }
 
