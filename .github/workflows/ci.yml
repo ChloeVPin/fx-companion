@@ -1,0 +1,168 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installer:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Static validation
+        run: |
+          set -euo pipefail
+          node --check cli.js
+          node --check product/cli_smoke_test.js
+          bash -n product/install.sh
+          bash -n product/sync.sh
+
+      - name: Package contains immutable source fallback bundle
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > /tmp/fxc-npm-pack.json
+          node - <<'NODE'
+          const packs = require('/tmp/fxc-npm-pack.json');
+          const files = new Set(packs[0].files.map((entry) => entry.path));
+          for (const required of [
+            'cli.js', 'PINNED_FX', 'product/fx_companion.zig',
+            'product/inject_hook.py', 'product/fxc',
+            'product/tests_fxcompanion.zig', 'product/install.sh',
+            'product/sync.sh',
+          ]) {
+            if (!files.has(required)) throw new Error(`npm package missing ${required}`);
+          }
+          NODE
+
+      - name: Installer smoke test
+        run: node product/cli_smoke_test.js
+
+  equivalence:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install verified Zig
+        run: |
+          set -euo pipefail
+          URL="https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz"
+          SHA256="b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+          curl --fail --silent --show-error --location "$URL" -o /tmp/zig.tar.xz
+          printf '%s  %s\n' "$SHA256" /tmp/zig.tar.xz | shasum -a 256 -c -
+          mkdir -p /usr/local/opt/zig
+          tar -xJf /tmp/zig.tar.xz -C /usr/local/opt/zig --strip-components=1
+          echo "/usr/local/opt/zig" >> "$GITHUB_PATH"
+
+      - name: Build pristine pinned workspace fingerprint
+        run: |
+          set -euo pipefail
+          PIN="$(tr -d '[:space:]' < PINNED_FX)"
+          test "${#PIN}" -eq 40
+          git clone --filter=blob:none https://github.com/vercel-labs/fx fx-src
+          git -C fx-src checkout "$PIN"
+          cp benchmarks/workspace_dump.zig fx-src/src/fx_companion_workspace_dump.zig
+          (
+            cd fx-src
+            zig build-exe src/fx_companion_workspace_dump.zig -lc -OReleaseFast -femit-bin=/tmp/workspace-dump-pristine
+          )
+
+      - name: Inject booster and build injected differential probes
+        run: |
+          set -euo pipefail
+          python3 product/inject_hook.py fx-src
+          cp product/tests_fxcompanion.zig fx-src/src/tests_fxcompanion.zig
+          cp benchmarks/git_cache_probe.zig fx-src/src/fx_companion_git_cache_probe.zig
+          cp benchmarks/concurrent_cache_probe.zig fx-src/src/fx_companion_concurrent_cache_probe.zig
+          cd fx-src
+          zig build-exe src/fx_companion_workspace_dump.zig -lc -OReleaseFast -femit-bin=/tmp/workspace-dump-injected
+          zig build-exe src/tests_fxcompanion.zig -lc -OReleaseFast -femit-bin=/tmp/equiv-probe
+          zig build-exe src/fx_companion_git_cache_probe.zig -lc -OReleaseFast -femit-bin=/tmp/git-cache-probe
+          zig build-exe src/fx_companion_concurrent_cache_probe.zig -lc -OReleaseFast -femit-bin=/tmp/concurrent-cache-probe
+
+      - name: Pristine vs injected workspace fingerprints
+        run: |
+          set -euo pipefail
+          ROOT=$(mktemp -d /tmp/fxc-diff-root.XXXXXX)
+          CACHE=$(mktemp -d /tmp/fxc-diff-cache.XXXXXX)
+          trap 'rm -rf -- "$ROOT" "$CACHE"' EXIT
+
+          mkdir -p "$ROOT/src/deep" "$ROOT/vendor/pkg" "$ROOT/.hidden/deep"
+          printf 'alpha\n' > "$ROOT/a.txt"
+          printf 'beta\n' > "$ROOT/src/deep/b.txt"
+          printf 'ignored\n' > "$ROOT/vendor/pkg/ignored.txt"
+          printf 'hidden\n' > "$ROOT/.hidden/deep/secret.txt"
+          printf 'vendor/\n' > "$ROOT/.gitignore"
+          ln -s a.txt "$ROOT/link_to_a"
+          git -C "$ROOT" init -q
+          git -C "$ROOT" add -- .gitignore a.txt src .hidden link_to_a
+          git -C "$ROOT" -c user.email=fxc@test -c user.name=fxc -c commit.gpgsign=false commit -qm init
+
+          pristine_git="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-pristine "$ROOT" git 100000 2>&1)"
+          injected_git_cold="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-injected "$ROOT" git 100000 2>&1)"
+          test -n "$(find "$CACHE/snapshots" -maxdepth 1 -type f -print -quit 2>/dev/null)"
+          injected_git_warm="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-injected "$ROOT" git 100000 2>&1)"
+          test "$pristine_git" = "$injected_git_cold"
+          test "$pristine_git" = "$injected_git_warm"
+
+          rm -rf "$CACHE" && mkdir -p "$CACHE"
+          pristine_recursive="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-pristine "$ROOT" recursive 600000 2>&1)"
+          injected_recursive_cold="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-injected "$ROOT" recursive 600000 2>&1)"
+          test -n "$(find "$CACHE/snapshots" -maxdepth 1 -type f -print -quit 2>/dev/null)"
+          injected_recursive_warm="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-injected "$ROOT" recursive 600000 2>&1)"
+          test "$pristine_recursive" = "$injected_recursive_cold"
+          test "$pristine_recursive" = "$injected_recursive_warm"
+
+          printf 'git fingerprint: %s\n' "$pristine_git"
+          printf 'git warm fingerprint: %s\n' "$injected_git_warm"
+          printf 'recursive fingerprint: %s\n' "$pristine_recursive"
+          printf 'recursive warm fingerprint: %s\n' "$injected_recursive_warm"
+
+      - name: Adversarial stock equivalence and cache races
+        run: |
+          set -euo pipefail
+          ROOT=$(mktemp -d /tmp/fxc-ci-root.XXXXXX)
+          CACHE=$(mktemp -d /tmp/fxc-ci-cache.XXXXXX)
+          trap 'rm -rf -- "$ROOT" "$CACHE" /tmp/fxc-race-*.log' EXIT
+          mkdir -p "$ROOT/src/deep"
+          printf 'a\n' > "$ROOT/a.txt"
+          printf 'b\n' > "$ROOT/src/deep/b.txt"
+          git -C "$ROOT" init -q
+          git -C "$ROOT" add .
+          git -C "$ROOT" -c user.email=fxc@test -c user.name=fxc -c commit.gpgsign=false commit -qm init
+
+          FX_COMPANION_HOME="$CACHE" /tmp/equiv-probe "$ROOT" 100000 --mutation-check
+          /tmp/concurrent-cache-probe "$ROOT" 500
+
+          rm -rf "$CACHE" && mkdir -p "$CACHE"
+          for i in $(seq 1 8); do
+            FX_COMPANION_HOME="$CACHE" /tmp/git-cache-probe "$ROOT" --allow-cold >"/tmp/fxc-race-$i.log" 2>&1 &
+          done
+          wait
+          FX_COMPANION_HOME="$CACHE" /tmp/git-cache-probe "$ROOT"
+          SNAP=$(python3 - "$CACHE" <<'PY'
+          from pathlib import Path
+          import re, sys
+          for candidate in (Path(sys.argv[1]) / "snapshots").glob("*"):
+              if re.fullmatch(r"[0-9a-f]{64}", candidate.name):
+                  print(candidate)
+                  break
+          PY
+          )
+          test -n "$SNAP"
+          printf 'corrupt' > "$SNAP"
+          FX_COMPANION_HOME="$CACHE" /tmp/git-cache-probe "$ROOT" --allow-cold
+          FX_COMPANION_HOME="$CACHE" /tmp/git-cache-probe "$ROOT"
+
+      - name: Repository tests
+        run: zig build test

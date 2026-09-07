@@ -17,6 +17,8 @@ extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
 extern "c" fn __error() *c_int;
 extern "c" fn system(command: [*:0]const u8) c_int;
 extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const Timespec = extern struct { sec: isize, nsec: isize };
 
@@ -238,9 +240,122 @@ fn verifyGitIdentityMutations() !void {
     cleaned = true;
 }
 
+/// A tracked-list cache hit must never bypass upstream's decision to reject an
+/// empty Git result and continue with recursive discovery. This is the exact
+/// cold/warm semantic hole that parsed-result caching used to create.
+fn verifyEmptyGitFallsBack() !void {
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/fxc-empty-git-{d}", .{nowNs()});
+    if (mkdir(path.ptr, 0o700) != 0) return error.TempDirFailed;
+    var cmd_buf: [1024]u8 = undefined;
+    var cleaned = false;
+    defer {
+        if (!cleaned) {
+            if (std.fmt.bufPrintZ(&cmd_buf, "rm -rf {s}", .{path})) |rm| {
+                _ = system(rm);
+            } else |_| {}
+        }
+    }
+
+    const init_cmd = try std.fmt.bufPrintZ(
+        &cmd_buf,
+        "printf 'visible\\n' > {s}/visible.txt && git -C {s} init -q && git -C {s} add visible.txt && git -C {s} rm -q --cached visible.txt",
+        .{ path, path, path, path },
+    );
+    try runShell(init_cmd);
+    companion.clearSnapshotCache();
+    const options: workspace_files.Options = .{ .candidate_cap = 100_000, .sort_paths = true };
+    _ = try compareFiles(path, options, "files/empty-git-fallback-cold");
+    _ = try compareFiles(path, options, "files/empty-git-fallback-warm");
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    workspace_files.companion_enabled = true;
+    const result = try workspace_files.discover(arena.allocator(), path, options);
+    if (result.source != .recursive or result.files.len == 0) return error.EmptyGitCacheBypassedFallback;
+
+    const rm_cmd = try std.fmt.bufPrintZ(&cmd_buf, "rm -rf {s}", .{path});
+    _ = system(rm_cmd);
+    cleaned = true;
+}
+
+/// Deterministic pre/post identity race: capture a cache publication token,
+/// mutate the index, then try to publish bytes from the old identity. The
+/// subsequent token must not see a cache hit under the new identity.
+fn verifyGitPublicationRace() !void {
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/fxc-git-race-{d}", .{nowNs()});
+    if (mkdir(path.ptr, 0o700) != 0) return error.TempDirFailed;
+    var cmd_buf: [1024]u8 = undefined;
+    var cleaned = false;
+    defer {
+        if (!cleaned) {
+            if (std.fmt.bufPrintZ(&cmd_buf, "rm -rf {s}", .{path})) |rm| {
+                _ = system(rm);
+            } else |_| {}
+        }
+    }
+
+    const init_cmd = try std.fmt.bufPrintZ(
+        &cmd_buf,
+        "printf 'a\\n' > {s}/a.txt && git -C {s} init -q && git -C {s} add a.txt && git -C {s} -c user.email=fxc@test -c user.name=fxc -c commit.gpgsign=false commit -qm init",
+        .{ path, path, path, path },
+    );
+    try runShell(init_cmd);
+    companion.clearSnapshotCache();
+
+    const before = (try companion.beginGitRawSnapshot(path, "/usr/bin/git", false, false, 64 * 1024 * 1024)) orelse
+        return error.MissingGitSnapshotToken;
+    defer companion.discardGitRawSnapshot(before);
+    const mutate_cmd = try std.fmt.bufPrintZ(
+        &cmd_buf,
+        "printf 'b\\n' > {s}/b.txt && git -C {s} add b.txt",
+        .{ path, path },
+    );
+    try runShell(mutate_cmd);
+    companion.finishGitRawSnapshot(before, "a.txt\x00");
+
+    const after = (try companion.beginGitRawSnapshot(path, "/usr/bin/git", false, false, 64 * 1024 * 1024)) orelse
+        return error.MissingGitSnapshotToken;
+    defer companion.discardGitRawSnapshot(after);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    if (companion.takeGitRaw(after, arena.allocator(), null) != null) return error.GitRacePublishedStaleRaw;
+
+    const rm_cmd = try std.fmt.bufPrintZ(&cmd_buf, "rm -rf {s}", .{path});
+    _ = system(rm_cmd);
+    cleaned = true;
+}
+
+fn verifyGitCachePolicyBypasses(root: []const u8) !void {
+    if (!gitIdentityReady(root)) return;
+    companion.clearSnapshotCache();
+    _ = try compareFiles(root, .{
+        .candidate_cap = 100_000,
+        .git_stdout_limit = 64 * 1024 * 1024,
+    }, "files/git-policy-high-limit");
+    const low_limit = try compareFiles(root, .{
+        .candidate_cap = 100_000,
+        .git_stdout_limit = 1,
+    }, "files/git-policy-low-limit");
+    if (low_limit.hit) return error.GitCacheIgnoredStdoutLimit;
+
+    var index_buf: [1024]u8 = undefined;
+    const index = try std.fmt.bufPrintZ(&index_buf, "{s}/.git/index", .{root});
+    if (setenv("GIT_INDEX_FILE", index.ptr, 1) != 0) return error.SetGitIndexEnvFailed;
+    defer _ = unsetenv("GIT_INDEX_FILE");
+    const env_first = try compareFiles(root, .{ .candidate_cap = 100_000 }, "files/git-policy-env-bypass-1");
+    const env_second = try compareFiles(root, .{ .candidate_cap = 100_000 }, "files/git-policy-env-bypass-2");
+    if (env_first.hit or env_second.hit) return error.GitCacheIgnoredEnvironmentOverride;
+}
+
 fn verifyCacheInvalidation(root: []const u8, cap: usize) !void {
     const options: workspace_files.Options = .{
-        .candidate_cap = cap,
+        // The companion deliberately declines capped first-N recursive walks
+        // at or below stock's default cap because source-order truncation cannot
+        // be proven from a parallel walk. Exercise the validated snapshot path
+        // above that boundary instead of expecting an unsafe stock-after-the-fact cache.
+        .candidate_cap = @max(cap, 100_001),
         .force_fallback = true,
         .sort_paths = true,
     };
@@ -382,7 +497,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }, "dirs/git-aware");
 
     try verifyGitListEquivalence(root, cap, mutation_check);
-    if (mutation_check) try verifyGitIdentityMutations();
+    if (mutation_check) {
+        try verifyGitIdentityMutations();
+        try verifyEmptyGitFallsBack();
+        try verifyGitPublicationRace();
+        try verifyGitCachePolicyBypasses(root);
+    }
     if (mutation_check) try verifyCacheInvalidation(root, cap);
 
     const case_count: usize = blk: {

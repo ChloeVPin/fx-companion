@@ -97,6 +97,7 @@ pub const WalkOut = shared.WalkOut;
 
 pub const WORKERS = 8;
 var workers_override: ?usize = null;
+var buffer_override: ?usize = null;
 
 /// Testing/benchmark hook: override the worker count for the next walk.
 /// Clamped to [1, WORKERS]: the thread stack below is sized for the
@@ -109,6 +110,16 @@ fn activeWorkers() usize {
     return workers_override orelse WORKERS;
 }
 const BUF_SIZE: usize = 128 * 1024; // healeycodes found this optimal
+
+/// Benchmark-only buffer override for measuring the getdirentries bulk size.
+/// Production policy lives in product/fx_companion.zig.
+pub fn setBufferSize(bytes: usize) void {
+    buffer_override = if (bytes == 0) null else @max(4096, @min(bytes, 512 * 1024));
+}
+
+fn activeBufferSize() usize {
+    return buffer_override orelse BUF_SIZE;
+}
 
 fn makeAttrlist(sum_sizes: bool) c.attrlist {
     // ATTR_CMN_ERROR is deliberately NOT requested: on current macOS it makes
@@ -274,7 +285,7 @@ fn pushDirPath(st: *WalkState, name: []const u8, prefix: []const u8) void {
 /// getattrlistbulk record pass (bulk backend inner loop).
 fn scanBulk(st: *WalkState, dfd: c_int, prefix: []const u8, buffer: []u8, local_entries: *u64, local_bytes: *u64) void {
     while (true) {
-        const n = c.getattrlistbulk(dfd, @constCast(@ptrCast(&st.attrs)), buffer.ptr, buffer.len, 0);
+        const n = c.getattrlistbulk(dfd, @ptrCast(@constCast(&st.attrs)), buffer.ptr, buffer.len, 0);
         if (n <= 0) break;
 
         var p: usize = 0;
@@ -374,8 +385,8 @@ fn scanOneDirNoClose(st: *WalkState, dfd: c_int, prefix: []const u8, buffer: []u
 }
 
 fn workerMain(st: *WalkState) void {
-    // Reusable 128 KB bulk buffer for this worker's whole lifetime.
-    const buffer = std.heap.c_allocator.alloc(u8, BUF_SIZE) catch return;
+    // Reusable benchmark-selected buffer for this worker's whole lifetime.
+    const buffer = std.heap.c_allocator.alloc(u8, activeBufferSize()) catch return;
     defer std.heap.c_allocator.free(buffer);
 
     while (st.takeDir()) |job| {
@@ -425,7 +436,7 @@ pub fn walkCommonEx(root: []const u8, sum_sizes: bool, use_gde: bool) !WalkOut {
     const root_fd = c.open(@ptrCast(root_z), c.O_RDONLY | c.O_NONBLOCK);
     if (root_fd < 0) return error.FtsOpenFailed;
     st.root_fd = root_fd;
-    const seed_buffer = std.heap.c_allocator.alloc(u8, BUF_SIZE) catch return error.FtsOpenFailed;
+    const seed_buffer = std.heap.c_allocator.alloc(u8, activeBufferSize()) catch return error.FtsOpenFailed;
     defer std.heap.c_allocator.free(seed_buffer);
     scanOneDirNoClose(&st, root_fd, "", seed_buffer);
 

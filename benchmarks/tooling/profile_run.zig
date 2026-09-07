@@ -1,4 +1,6 @@
-//! /profile entry: production discover engagement, then recursive walk profile.
+//! Standalone production discovery profiler. This is deliberately not wired
+//! into fx's command/UI surface; copy it beside the pinned upstream sources
+//! when profiling is needed.
 const std = @import("std");
 const companion = @import("core/workspace/fx_companion.zig");
 const workspace_files = @import("core/workspace/workspace_files.zig");
@@ -11,10 +13,8 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
-pub fn run(arena: std.mem.Allocator, workspace_root: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
-    var aw: std.Io.Writer.Allocating = .fromArrayList(arena, out);
-    const w = &aw.writer;
-    try w.writeAll("fx-companion engagement (production discover)\n");
+pub fn run(workspace_root: []const u8) !void {
+    std.debug.print("fx-companion engagement (production discover)\n", .{});
     companion.clearSnapshotCache();
     workspace_files.companion_enabled = true;
 
@@ -39,30 +39,25 @@ pub fn run(arena: std.mem.Allocator, workspace_root: []const u8, out: *std.Array
     else
         "skipped:unsorted-or-recursive";
 
-    try w.print("  source        {s}\n", .{@tagName(cold.source)});
-    try w.print("  companion     cold={s} warm={s} ({s})\n", .{
+    std.debug.print("  source        {s}\n", .{@tagName(cold.source)});
+    std.debug.print("  companion     cold={s} warm={s} ({s})\n", .{
         if (cold_hit) "hit" else "miss",
         if (warm_hit) "hit" else "miss",
         companion_label,
     });
-    try w.print("  paths         cold={d} warm={d}\n", .{ cold.files.len, warm.files.len });
-    try w.print("  git_list_ns   cold={d} warm={d} ({d:.3} ms / {d:.3} ms)\n", .{
+    std.debug.print("  paths         cold={d} warm={d}\n", .{ cold.files.len, warm.files.len });
+    std.debug.print("  discover_ns   cold={d} warm={d} ({d:.3} ms / {d:.3} ms)\n", .{
         cold_ns,
         warm_ns,
         @as(f64, @floatFromInt(cold_ns)) / 1e6,
         @as(f64, @floatFromInt(warm_ns)) / 1e6,
     });
-    try w.writeAll("  no_model_request true\n\n");
-    out.* = aw.toArrayList();
+    std.debug.print("  no_model_request true\n", .{});
+}
 
-    var rest: std.ArrayListUnmanaged(u8) = .empty;
-    companion.runBenchmark(arena, workspace_root, &rest) catch |err| {
-        rest.deinit(arena);
-        var aw2: std.Io.Writer.Allocating = .fromArrayList(arena, out);
-        try aw2.writer.print("recursive profile skipped: {s}\n", .{@errorName(err)});
-        out.* = aw2.toArrayList();
-        return;
-    };
-    try out.appendSlice(arena, rest.items);
-    rest.deinit(arena);
+pub fn main(init: std.process.Init.Minimal) !void {
+    var args = std.process.Args.Iterator.init(init.args);
+    _ = args.next();
+    const root = args.next() orelse return error.MissingRoot;
+    try run(root);
 }

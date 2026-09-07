@@ -5,9 +5,10 @@
  *   npx github:ChloeVPin/fx-companion            install (default)
  *   npx github:ChloeVPin/fx-companion status     check what's installed
  *
- * Downloads the newest prebuilt boosted fx binary from GitHub Releases when
- * available. If no compatible release exists yet, it builds the pinned
- * upstream source locally, preserving the same source-injection path.
+ * Downloads the matching prebuilt boosted fx binary from GitHub Releases when
+ * available. If no compatible release exists yet, it builds from the exact
+ * source bundle shipped with this package. It never executes source fetched
+ * from a mutable branch.
  */
 'use strict';
 
@@ -21,10 +22,28 @@ const PKG_VERSION = require('./package.json').version;
 const REPO = 'ChloeVPin/fx-companion';
 const USER_AGENT = 'OpenAI File Downloader, XaiImageApiFetch/1.0';
 const API = process.env.FXC_API_ROOT || `https://api.github.com/repos/${REPO}`;
-const SOURCE_REF = process.env.FXC_SOURCE_REF || 'main';
-const RAW_BASE = process.env.FXC_RAW_BASE || `https://raw.githubusercontent.com/${REPO}/${SOURCE_REF}`;
 const INSTALL_HOME = process.env.FX_COMPANION_HOME || path.join(os.homedir(), '.fx-companion');
 const INSTALL_DIR = path.join(INSTALL_HOME, 'bin');
+const RELEASE_TAG = `v${PKG_VERSION}`;
+const RELEASE_ASSET = `fx-boosted-macos-arm64-${RELEASE_TAG}.tar.gz`;
+
+const SOURCE_FILES = [
+  'PINNED_FX',
+  'product/fx_companion.zig',
+  'product/inject_hook.py',
+  'product/fxc',
+  'product/tests_fxcompanion.zig',
+  'product/install.sh',
+  'product/sync.sh',
+];
+
+const MANAGER_FILES = SOURCE_FILES.map((relative) => ({
+  relative,
+  destination: relative === 'PINNED_FX'
+    ? path.join(INSTALL_HOME, 'PINNED_FX')
+    : path.join(INSTALL_HOME, path.basename(relative)),
+  executable: ['product/fxc', 'product/install.sh', 'product/sync.sh'].includes(relative),
+}));
 
 class ReleaseUnavailable extends Error {}
 
@@ -37,6 +56,37 @@ function sh(cmd, args, opts = {}) {
   return spawnSync(cmd, args, { stdio: opts.capture ? 'pipe' : 'inherit', encoding: 'utf8', ...opts });
 }
 
+function packagedSourcePath(relative) {
+  const packaged = path.join(__dirname, relative);
+  let stat;
+  try {
+    stat = fs.lstatSync(packaged);
+  } catch {
+    throw new Error(`packaged source fallback is incomplete: missing ${relative}`);
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`packaged source fallback rejected non-regular file: ${relative}`);
+  return packaged;
+}
+
+function atomicCopyFile(source, destination, mode = null) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  const staged = `${destination}.tmp-${process.pid}`;
+  try {
+    fs.copyFileSync(source, staged);
+    if (mode !== null) fs.chmodSync(staged, mode);
+    fs.renameSync(staged, destination);
+  } finally {
+    fs.rmSync(staged, { force: true });
+  }
+}
+
+function installManagerBundle() {
+  for (const entry of MANAGER_FILES) {
+    atomicCopyFile(packagedSourcePath(entry.relative), entry.destination, entry.executable ? 0o755 : null);
+  }
+  console.log(`✓ installed manager bundle in ${INSTALL_HOME}`);
+}
+
 async function api(pathName) {
   const res = await fetch(`${API}${pathName}`, {
     headers: { 'user-agent': USER_AGENT, accept: 'application/vnd.github+json' },
@@ -45,14 +95,20 @@ async function api(pathName) {
   return res.json();
 }
 
-async function resolveLatestRelease() {
+async function resolveRelease() {
   try {
-    const rel = await api('/releases/latest');
-    const asset = (rel.assets || []).find((a) => /^fx-boosted-macos-arm64-.*\.tar\.gz$/.test(a.name));
+    const rel = await api(`/releases/tags/${encodeURIComponent(RELEASE_TAG)}`);
+    const asset = (rel.assets || []).find((a) => a.name === RELEASE_ASSET);
     const sums = (rel.assets || []).find((a) => a.name === 'SHA256SUMS');
-    if (!asset) throw new ReleaseUnavailable('no macos-arm64 asset');
-    console.log(`latest release: ${rel.tag_name}`);
-    return { tag: rel.tag_name, version: rel.tag_name.replace(/^v/, ''), assetUrl: asset.browser_download_url, sumsUrl: sums ? sums.browser_download_url : null };
+    if (rel.tag_name !== RELEASE_TAG) throw new ReleaseUnavailable(`release tag mismatch: expected ${RELEASE_TAG}`);
+    if (!asset) throw new ReleaseUnavailable(`release ${RELEASE_TAG} has no ${RELEASE_ASSET}`);
+    console.log(`release: ${rel.tag_name}`);
+    return {
+      tag: rel.tag_name,
+      assetName: asset.name,
+      assetUrl: asset.browser_download_url,
+      sumsUrl: sums ? sums.browser_download_url : null,
+    };
   } catch (e) {
     console.log(`prebuilt release unavailable (${e.message}); falling back to pinned source build`);
     return null;
@@ -87,68 +143,79 @@ async function installRelease(rel, tmp) {
   }
   if (!sumsResponse.ok) throw new Error(`checksum download failed (${sumsResponse.status}); refusing an unverified install`);
   const sum = await sumsResponse.text();
-  const assetName = path.basename(rel.assetUrl);
-  let expected = null;
+  const assetName = rel.assetName;
+  const matches = [];
   for (const line of sum.split('\n')) {
     const [hash, name] = line.trim().split(/\s+/);
-    if (name === assetName && /^[a-f0-9]{64}$/i.test(hash)) expected = hash.toLowerCase();
+    if (name === assetName && /^[a-f0-9]{64}$/i.test(hash)) matches.push(hash.toLowerCase());
   }
-  if (!expected) throw new Error(`SHA256SUMS has no valid entry for ${assetName}`);
+  if (matches.length !== 1) throw new Error(`SHA256SUMS must contain exactly one valid entry for ${assetName}`);
+  const expected = matches[0];
   const actual = crypto.createHash('sha256').update(buf).digest('hex');
   if (expected !== actual) throw new Error(`checksum mismatch!\n  expected ${expected}\n  actual   ${actual}`);
   console.log('✓ checksum ok');
 
-  const extracted = path.join(tmp, 'fx');
-  const tar = sh('tar', ['-xzf', tgz, '-C', tmp]);
-  if (tar.status !== 0 || !fs.existsSync(extracted)) throw new Error('archive did not contain an fx binary');
-  if (!hasBooster(fs.readFileSync(extracted))) throw new Error('binary failed the booster integrity check; refusing to install');
-  installBinary(extracted);
-}
+  const listing = sh('tar', ['-tzf', tgz], { capture: true });
+  if (listing.status !== 0) throw new Error('could not inspect release archive');
+  const members = (listing.stdout || '').split(/\r?\n/).filter(Boolean);
+  if (members.length !== 1 || members[0] !== 'fx') throw new Error('release archive must contain exactly one top-level fx file');
 
-async function fetchSourceFile(relative, destination) {
-  const res = await fetch(`${RAW_BASE}/${relative}`, { headers: { 'user-agent': USER_AGENT } });
-  if (!res.ok) throw new Error(`source fallback download failed (${res.status}): ${relative}`);
-  fs.writeFileSync(destination, Buffer.from(await res.arrayBuffer()));
+  const extracted = path.join(tmp, 'fx');
+  const tar = sh('tar', ['-xzf', tgz, '-C', tmp, 'fx']);
+  if (tar.status !== 0 || !fs.existsSync(extracted) || !fs.lstatSync(extracted).isFile()) throw new Error('archive did not contain a regular fx binary');
+  if (!hasBooster(fs.readFileSync(extracted))) throw new Error('binary failed the booster integrity check; refusing to install');
+  installManagerBundle();
+  installBinary(extracted);
 }
 
 async function installFromSource(tmp) {
   const sourceRoot = path.join(tmp, 'source');
   const productRoot = path.join(sourceRoot, 'product');
   fs.mkdirSync(productRoot, { recursive: true });
-  const files = [
-    ['PINNED_FX', path.join(sourceRoot, 'PINNED_FX')],
-    ['product/fx_companion.zig', path.join(productRoot, 'fx_companion.zig')],
-    ['product/inject_hook.py', path.join(productRoot, 'inject_hook.py')],
-    ['product/fxc', path.join(productRoot, 'fxc')],
-    ['product/tests_fxcompanion.zig', path.join(productRoot, 'tests_fxcompanion.zig')],
-    ['product/install.sh', path.join(productRoot, 'install.sh')],
-    ['product/sync.sh', path.join(productRoot, 'sync.sh')],
-    ['product/benchmark_runner.zig', path.join(productRoot, 'benchmark_runner.zig')],
-    ['product/profile_run.zig', path.join(productRoot, 'profile_run.zig')],
-  ];
-  for (const [relative, destination] of files) {
-    process.stdout.write(`↓ fetching source fallback file ${relative}\n`);
-    await fetchSourceFile(relative, destination);
+  for (const relative of SOURCE_FILES) {
+    const packaged = packagedSourcePath(relative);
+    const destination = path.join(sourceRoot, relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(packaged, destination);
   }
   for (const executable of ['fxc', 'install.sh', 'sync.sh']) fs.chmodSync(path.join(productRoot, executable), 0o755);
 
-  const installer = process.env.FXC_SOURCE_INSTALL_SCRIPT || path.join(productRoot, 'install.sh');
+  const installer = path.join(productRoot, 'install.sh');
+  const sourceEnv = { ...process.env, FX_COMPANION_HOME: INSTALL_HOME };
+  // The automatic fallback is deliberately bound to the package's PINNED_FX
+  // and owned upstream directory. Developer overrides remain available when
+  // running sync.sh explicitly, but cannot silently change an npm install.
+  delete sourceEnv.FX_PIN_FILE;
+  delete sourceEnv.FX_UPSTREAM_DIR;
   const result = sh('bash', [installer], {
-    env: { ...process.env, FX_COMPANION_HOME: INSTALL_HOME },
+    env: sourceEnv,
   });
   if (result.status !== 0) throw new Error(`pinned source build failed with exit ${result.status ?? 'signal'}`);
   if (!fs.existsSync(path.join(INSTALL_DIR, 'fx'))) throw new Error('pinned source build produced no fx binary');
   activateOnPath();
-  console.log(`✓ installed pinned source build from ${SOURCE_REF}`);
+  console.log(`✓ installed pinned source build from packaged sources`);
 }
 
 function installBinary(built) {
   const staged = path.join(INSTALL_DIR, `.fx.tmp-${process.pid}`);
   fs.mkdirSync(INSTALL_DIR, { recursive: true });
-  fs.copyFileSync(built, staged);
-  fs.chmodSync(staged, 0o755);
-  fs.renameSync(staged, path.join(INSTALL_DIR, 'fx'));
-  retireOld();
+  try {
+    fs.copyFileSync(built, staged);
+    fs.chmodSync(staged, 0o755);
+    const fd = fs.openSync(staged, 'r');
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(staged, path.join(INSTALL_DIR, 'fx'));
+    try {
+      const dirfd = fs.openSync(INSTALL_DIR, 'r');
+      try { fs.fsyncSync(dirfd); } finally { fs.closeSync(dirfd); }
+    } catch {}
+  } finally {
+    fs.rmSync(staged, { force: true });
+  }
   console.log(`✓ installed ${INSTALL_DIR}/fx`);
   activateOnPath();
 }
@@ -156,23 +223,6 @@ function installBinary(built) {
 function hasBooster(buf) {
   // The kill-switch env name is compiled into every boosted binary.
   return buf.includes(Buffer.from('FX_NO_COMPANION', 'ascii'));
-}
-
-function retireOld() {
-  // Move previously installed stock fx binaries aside. User data in ~/.fx
-  // (sessions, chats, skills, settings) is never touched.
-  for (const p of [
-    path.join(os.homedir(), '.local/bin/fx'),
-    '/usr/local/bin/fx',
-  ]) {
-    try {
-      if (fs.existsSync(p) && !fs.lstatSync(p).isSymbolicLink()) {
-        const bak = `${p}.stock.bak`;
-        fs.renameSync(p, bak);
-        console.log(`✓ retired previous ${p} (backup at ${bak})`);
-      }
-    } catch {}
-  }
 }
 
 async function install() {
@@ -183,7 +233,7 @@ async function install() {
   console.log(`fx-companion v${PKG_VERSION} — installing boosted fx…`);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fxc-'));
   try {
-    const rel = await resolveLatestRelease();
+    const rel = await resolveRelease();
     if (rel) {
       try {
         await installRelease(rel, tmp);
@@ -203,7 +253,7 @@ async function install() {
   console.log('');
   console.log('Then just run `fx` — same commands, same output, faster.');
   console.log('Stock anytime: FX_NO_COMPANION=1 fx …   ·   Sessions/skills/data untouched.');
-  console.log('In any fx session: /benchmark runs the raw speed tests.');
+  console.log('Diagnostics stay outside fx; use the repository benchmark tooling when profiling.');
 }
 
 function activateOnPath() {
@@ -237,7 +287,7 @@ function activateOnPath() {
             continue; // owned by something else
           }
         } else {
-          continue; // real file; retireOld handled known stock paths
+          continue; // real file owned by something else; never replace it
         }
       }
       fs.symlinkSync(ours, link);

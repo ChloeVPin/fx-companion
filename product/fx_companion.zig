@@ -2,8 +2,8 @@
 //!
 //! Drop-in replacement for the inner loop of walkWorkspacePaths on
 //! macOS/arm64. Same directory-read syscall family as stock (getdirentries,
-//! which std.Io.Dir.Iterator drives through readdir), but with 128 KB
-//! per-worker buffers and an 8-thread work-stealing pool instead of a
+//! which std.Io.Dir.Iterator drives through readdir), but with measured,
+//! workload-aware per-worker buffers and a bounded hardware-aware pool instead of a
 //! 2 KB-buffer single thread. Sorted results are packed into a process-local
 //! snapshot; repeat walks validate directory identity, mtime, and ctime before
 //! materializing it. Output is byte-identical: relative slash paths, same
@@ -37,9 +37,55 @@ extern "c" fn read(fd: c_int, buf: [*]u8, nbyte: usize) isize;
 extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+extern "c" fn opendir(path: [*]const u8) ?*anyopaque;
+extern "c" fn readdir(dirp: *anyopaque) ?[*]u8;
+extern "c" fn closedir(dirp: *anyopaque) c_int;
+extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+extern "c" fn sysctlbyname(
+    name: [*:0]const u8,
+    oldp: ?*anyopaque,
+    oldlenp: *usize,
+    newp: ?*anyopaque,
+    newlen: usize,
+) c_int;
 // Fixed-arity libc call; safe to hand-declare. The silent-noop variadic
 // trap applies only to fcntl-style varargs functions.
 extern "c" fn getdirentries(fd: c_int, buf: [*]u8, nbytes: usize, basep: *i64) isize;
+
+const Timespec = extern struct { sec: isize, nsec: isize };
+
+fn nowNs() u64 {
+    var ts: Timespec = undefined;
+    _ = clock_gettime(4, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+var performance_core_cache: std.atomic.Value(u32) = .init(0);
+
+/// Returns macOS's performance-core count when the topology sysctl exists.
+/// Encoded atomic cache: 0=unqueried, 1=unavailable, N+1=core count N.
+/// Failure is performance-only; traversal falls back to a logical-CPU policy.
+fn performanceCoreCount() ?usize {
+    if (comptime builtin.os.tag != .macos) return null;
+    const cached = performance_core_cache.load(.acquire);
+    if (cached != 0) return if (cached == 1) null else cached - 1;
+
+    var value: c_int = 0;
+    var size: usize = @sizeOf(c_int);
+    const rc = sysctlbyname(
+        "hw.perflevel0.physicalcpu",
+        @ptrCast(&value),
+        &size,
+        null,
+        0,
+    );
+    const encoded: u32 = if (rc == 0 and size == @sizeOf(c_int) and value > 0)
+        @as(u32, @intCast(value)) + 1
+    else
+        1;
+    performance_core_cache.store(encoded, .release);
+    return if (encoded == 1) null else encoded - 1;
+}
 
 // Thin pthread shims (Darwin's pthread types are opaque through cImport;
 // runtime-init with default attrs, same pattern proven in fx-companion).
@@ -99,10 +145,9 @@ const O_RDONLY: c_int = 0;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
-const BUF_SIZE: usize = 128 * 1024;
-const WORKERS: usize = 8;
+const MAX_WORKERS: usize = 16;
 const CACHE_KEY_BYTES: usize = 2048;
-const CACHE_VALIDATE_WORKERS: usize = 8;
+const MAX_CACHE_VALIDATE_WORKERS: usize = 8;
 const CACHE_MAX_PATHS: usize = 1_000_000;
 const CACHE_MAX_DIRECTORIES: usize = 100_000;
 const CACHE_MAX_PATH_BYTES: usize = 128 * 1024 * 1024;
@@ -112,7 +157,82 @@ const CACHE_MAX_DIRECTORY_BYTES: usize = 64 * 1024 * 1024;
 /// stock's result instead of paying for a discarded traversal.
 const STOCK_FIRST_CAP: usize = 100_000;
 const DISK_CACHE_MAGIC: u32 = 0x31435846;
-const DISK_CACHE_VERSION: u32 = 1;
+const DISK_CACHE_VERSION: u32 = 2;
+const CACHE_ABI_TAG = "fx-companion-cache-v2";
+/// Replaced by inject_hook.py with SHA-256(workspace_files.zig) before any
+/// patching. Cache keys therefore stop matching automatically when upstream's
+/// workspace semantics change, even if the on-disk schema itself did not.
+const UPSTREAM_FINGERPRINT = "FXC_UPSTREAM_FINGERPRINT_UNSET";
+const DISK_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const DISK_CACHE_MAX_ENTRIES: usize = 256;
+var disk_tmp_counter: std.atomic.Value(u64) = .init(0);
+
+const TraversalPolicy = struct {
+    participants: usize,
+    buffer_bytes: usize,
+    validation_workers: usize,
+
+    const large_buffer: usize = 128 * 1024;
+    const xlarge_buffer: usize = 256 * 1024;
+
+    /// 128 KiB was the stable production-path choice for the root scan; once
+    /// it reveals breadth, workers can move to the 256 KiB moderate-fanout tier.
+    fn seedBufferBytes() usize {
+        return large_buffer;
+    }
+
+    /// Conservative Apple-Silicon scaling derived from the M2 worker/buffer
+    /// sweep. Very wide roots saturate quickly, while moderate fan-out such as
+    /// Homebrew still benefits from more overlap. Never exceed the work exposed
+    /// by the seed scan. A single queued child stays serial to avoid thread
+    /// overhead on deep/narrow trees.
+    fn forWalk(
+        logical_cpus_raw: usize,
+        performance_cores: ?usize,
+        pending_after_seed: usize,
+    ) TraversalPolicy {
+        const logical_cpus = @max(logical_cpus_raw, 1);
+        const very_wide = pending_after_seed >= 64;
+        const complex_moderate = pending_after_seed >= 8 and !very_wide;
+        const fallback_hardware_target = @max(1, (logical_cpus + 1) / 2);
+        const hardware_target = @min(
+            @min(MAX_WORKERS, 8),
+            @max(1, performance_cores orelse fallback_hardware_target),
+        );
+        const participants = if (pending_after_seed <= 1)
+            1
+        else
+            @max(1, @min(hardware_target, pending_after_seed + 1));
+        const buffer_bytes = if (participants == 1)
+            large_buffer
+        else if (complex_moderate)
+            xlarge_buffer
+        else
+            large_buffer;
+        return .{
+            .participants = participants,
+            .buffer_bytes = buffer_bytes,
+            .validation_workers = 1,
+        };
+    }
+
+    /// Metadata validation is a different workload: on the measured M2,
+    /// eight fstat/fstatat lanes won on a 15k-directory Homebrew snapshot.
+    /// Keep the existing directory-count guard while expressing it through the
+    /// same hardware policy and retaining the sequential fast path for tiny sets.
+    fn forValidation(logical_cpus_raw: usize, directory_count: usize) TraversalPolicy {
+        const logical_cpus = @max(logical_cpus_raw, 1);
+        const lanes = if (directory_count <= 32)
+            1
+        else
+            @max(1, @min(@min(logical_cpus, MAX_CACHE_VALIDATE_WORKERS), (directory_count + 31) / 32));
+        return .{
+            .participants = 1,
+            .buffer_bytes = seedBufferBytes(),
+            .validation_workers = lanes,
+        };
+    }
+};
 
 const CachedPath = struct {
     offset: u32,
@@ -210,11 +330,13 @@ fn makeCacheKey(
 ) ?CacheKey {
     var key = CacheKey{};
     const flags = [_]u8{
-        2, // cache format version
+        3, // recursive cache semantic version
         @intFromBool(target_files),
         @intFromBool(include_hidden),
     };
-    if (!key.append(&flags) or
+    if (!key.append(CACHE_ABI_TAG) or
+        !key.append(UPSTREAM_FINGERPRINT) or
+        !key.append(&flags) or
         !key.appendU64(workspace_root.len) or
         !key.append(workspace_root) or
         !key.appendU64(candidate_cap) or
@@ -251,12 +373,13 @@ fn cacheFilesystemSupported(root_fd: c_int) bool {
 const CacheValidationContext = struct {
     root_fd: c_int,
     directories: []const CachedDirectory,
+    lanes: usize,
     changed: std.atomic.Value(bool) = .init(false),
 };
 
 fn validateCacheLane(context: *CacheValidationContext, lane: usize) void {
     var index = lane;
-    while (index < context.directories.len) : (index += CACHE_VALIDATE_WORKERS) {
+    while (index < context.directories.len) : (index += context.lanes) {
         if (context.changed.load(.acquire)) return;
         const directory = context.directories[index];
         var current: c.struct_stat = undefined;
@@ -294,11 +417,14 @@ fn validateDirectorySnapshot(directories: []const CachedDirectory, workspace_roo
     if (!cacheFilesystemSupported(root_fd)) return false;
     if (directories.len <= 32) return validateCacheSequential(root_fd, directories);
 
-    var context = CacheValidationContext{ .root_fd = root_fd, .directories = directories };
-    var threads: [CACHE_VALIDATE_WORKERS - 1]std.Thread = undefined;
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const lanes = TraversalPolicy.forValidation(cpu_count, directories.len).validation_workers;
+    if (lanes == 1) return validateCacheSequential(root_fd, directories);
+    var context = CacheValidationContext{ .root_fd = root_fd, .directories = directories, .lanes = lanes };
+    var threads: [MAX_CACHE_VALIDATE_WORKERS - 1]std.Thread = undefined;
     var started: usize = 0;
     var spawn_failed = false;
-    for (&threads, 1..) |*thread, lane| {
+    for (threads[0 .. lanes - 1], 1..) |*thread, lane| {
         thread.* = std.Thread.spawn(.{}, validateCacheLane, .{ &context, lane }) catch {
             spawn_failed = true;
             break;
@@ -470,6 +596,13 @@ fn statFromStamp(stamp: DirectoryStamp) c.struct_stat {
 }
 
 fn companionHomeDir(buf: []u8) ?[:0]u8 {
+    if (std.c.getenv("FX_COMPANION_HOME")) |configured| {
+        const len = std.mem.len(configured);
+        if (len == 0 or len + 1 > buf.len) return null;
+        @memcpy(buf[0..len], configured[0..len]);
+        buf[len] = 0;
+        return buf[0..len :0];
+    }
     const home = std.c.getenv("HOME") orelse return null;
     const home_len = std.mem.len(home);
     if (home_len == 0 or home_len + 32 >= buf.len) return null;
@@ -478,10 +611,10 @@ fn companionHomeDir(buf: []u8) ?[:0]u8 {
 }
 
 fn snapshotDirZ(buf: []u8) ?[:0]u8 {
-    const home = std.c.getenv("HOME") orelse return null;
-    const home_len = std.mem.len(home);
-    if (home_len == 0 or home_len + 48 >= buf.len) return null;
-    const written = std.fmt.bufPrintZ(buf, "{s}/.fx-companion/snapshots", .{home[0..home_len]}) catch return null;
+    var home_buf: [512]u8 = undefined;
+    const home = companionHomeDir(&home_buf) orelse return null;
+    if (home.len + 16 >= buf.len) return null;
+    const written = std.fmt.bufPrintZ(buf, "{s}/snapshots", .{home}) catch return null;
     return buf[0..written.len :0];
 }
 
@@ -511,25 +644,85 @@ fn diskSnapshotPath(key: []const u8, buf: []u8) ?[:0]u8 {
     return buf[0..written.len :0];
 }
 
+const DiskSnapshotMeta = struct {
+    name: [64]u8,
+    size: usize,
+    mtime_sec: i64,
+    live: bool = true,
+};
+
+fn isSnapshotName(name: []const u8) bool {
+    if (name.len != 64) return false;
+    for (name) |ch| {
+        if (!((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f'))) return false;
+    }
+    return true;
+}
+
+/// Opportunistic bounded-LRU pruning. Snapshot filenames are content-key
+/// digests, so unlinking an old entry is always safe: a concurrent reader
+/// keeps its fd and a future request simply rebuilds the entry.
+fn pruneDiskSnapshots() void {
+    var dir_buf: [512]u8 = undefined;
+    const dir_path = snapshotDirZ(&dir_buf) orelse return;
+    const dp = opendir(dir_path.ptr) orelse return;
+    defer _ = closedir(dp);
+
+    var entries: [512]DiskSnapshotMeta = undefined;
+    var count: usize = 0;
+    var total: usize = 0;
+    while (true) {
+        const dent = readdir(dp) orelse break;
+        const namlen: usize = std.mem.readInt(u16, dent[18..20], .little);
+        if (namlen == 0) continue;
+        const name = dent[21 .. 21 + namlen];
+        if (!isSnapshotName(name)) continue;
+        var full: [768]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&full, "{s}/{s}", .{ dir_path, name }) catch continue;
+        var st: c.struct_stat = undefined;
+        if (c.stat(path.ptr, &st) != 0 or (st.st_mode & 0o170000) != 0o100000) continue;
+        const file_size: usize = @intCast(@max(st.st_size, 0));
+        if (count == entries.len) {
+            _ = unlink(path.ptr);
+            continue;
+        }
+        @memcpy(entries[count].name[0..], name);
+        entries[count].size = file_size;
+        entries[count].mtime_sec = st.st_mtimespec.tv_sec;
+        entries[count].live = true;
+        count += 1;
+        total = std.math.add(usize, total, file_size) catch std.math.maxInt(usize);
+    }
+
+    var live_count = count;
+    while (live_count > DISK_CACHE_MAX_ENTRIES or total > DISK_CACHE_MAX_BYTES) {
+        var oldest: ?usize = null;
+        for (entries[0..count], 0..) |entry, index| {
+            if (!entry.live) continue;
+            if (oldest == null or entry.mtime_sec < entries[oldest.?].mtime_sec) oldest = index;
+        }
+        const index = oldest orelse break;
+        var full: [768]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&full, "{s}/{s}", .{ dir_path, entries[index].name[0..] }) catch break;
+        if (unlink(path.ptr) == 0) {
+            total -|= entries[index].size;
+            live_count -= 1;
+        }
+        entries[index].live = false;
+    }
+}
+
 fn deleteDiskSnapshot(key: []const u8) void {
     var path_buf: [768]u8 = undefined;
     const path = diskSnapshotPath(key, &path_buf) orelse return;
     _ = unlink(path.ptr);
 }
 
-fn persistDiskSnapshot(cache: *const SnapshotCache) void {
-    if (!cache.valid) return;
-    const blob = cache.blob orelse return;
-    const paths = cache.paths orelse return;
-    const directories = cache.directories orelse return;
-    persistDiskSnapshotStaged(
-        cache.key[0..cache.key_len],
-        blob,
-        paths,
-        directories,
-        cache.incomplete,
-        cache.overlong,
-    );
+fn diskSnapshotExists(key: []const u8) bool {
+    var path_buf: [768]u8 = undefined;
+    const path = diskSnapshotPath(key, &path_buf) orelse return false;
+    var st: c.struct_stat = undefined;
+    return c.stat(path.ptr, &st) == 0 and (st.st_mode & 0o170000) == 0o100000;
 }
 
 /// Coalesced single-buffer persist: same on-disk format as before, but one
@@ -552,12 +745,13 @@ fn persistDiskSnapshotStaged(
     if (!ensureSnapshotDir()) return;
     var path_buf: [768]u8 = undefined;
     const path = diskSnapshotPath(key, &path_buf) orelse return;
-    var tmp_buf: [780]u8 = undefined;
-    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{path}) catch return;
+    var tmp_buf: [820]u8 = undefined;
+    const tmp_seq = disk_tmp_counter.fetchAdd(1, .monotonic);
+    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp.{d}.{d}", .{ path, c.getpid(), tmp_seq }) catch return;
 
-    // Total: magic(4) version(4) key_len(4) key incomplete(1) overlong(8)
-    // path_count(4) blob_len(4) blob paths(*8) dir_count(4) per-dir(4+len+40).
-    var total: usize = 4 + 4 + 4 + key.len + 1 + 8 + 4 + 4 + blob.len + paths.len * 8 + 4;
+    // Total: payload plus a trailing SHA-256 digest. The digest makes partial,
+    // torn, and maliciously modified cache files fail closed before decoding.
+    var total: usize = 4 + 4 + 4 + key.len + 1 + 8 + 4 + 4 + blob.len + paths.len * 8 + 4 + 32;
     for (directories) |directory| {
         total = std.math.add(usize, total, 4 + directory.path.len + @sizeOf(DirectoryStamp)) catch return;
     }
@@ -594,9 +788,12 @@ fn persistDiskSnapshotStaged(
         const stamp = stampFromStat(directory.expected);
         put(buf, &off, std.mem.asBytes(&stamp));
     }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(buf[0..off], &digest, .{});
+    put(buf, &off, &digest);
     std.debug.assert(off == total);
 
-    const fd = c.open(tmp.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+    const fd = c.open(tmp.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
     if (fd < 0) return;
     var ok = false;
     defer {
@@ -611,6 +808,7 @@ fn persistDiskSnapshotStaged(
     }
     if (rename(tmp.ptr, path.ptr) != 0) return;
     ok = true;
+    pruneDiskSnapshots();
 }
 
 const StagedSnapshot = struct {
@@ -661,7 +859,7 @@ fn loadDiskSnapshotStaged(key: *const CacheKey) ?StagedSnapshot {
     const file_size: usize = @intCast(@max(fst.st_size, 0));
     // Lower bound: fixed header + key. Upper bound: worst-case caps
     // (~550 MiB) with headroom; rejects corrupt huge sizes before alloc.
-    const min_size: usize = 4 + 4 + 4 + key.len + 1 + 8 + 4 + 4;
+    const min_size: usize = 4 + 4 + 4 + key.len + 1 + 8 + 4 + 4 + 32;
     const max_size: usize = 640 * 1024 * 1024;
     if (file_size < min_size or file_size > max_size) return null;
     const file = std.heap.c_allocator.alloc(u8, file_size) catch return null;
@@ -672,6 +870,12 @@ fn loadDiskSnapshotStaged(key: *const CacheKey) ?StagedSnapshot {
         if (n <= 0) return null;
         got += @intCast(n);
     }
+
+    if (file.len < 32) return null;
+    const payload = file[0 .. file.len - 32];
+    var expected_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &expected_digest, .{});
+    if (!std.mem.eql(u8, &expected_digest, file[file.len - 32 ..])) return null;
 
     var off: usize = 0;
     const take = struct {
@@ -685,28 +889,28 @@ fn loadDiskSnapshotStaged(key: *const CacheKey) ?StagedSnapshot {
     var magic: u32 = 0;
     var version: u32 = 0;
     var key_len: u32 = 0;
-    if (!take(file, &off, std.mem.asBytes(&magic)) or magic != DISK_CACHE_MAGIC) return null;
-    if (!take(file, &off, std.mem.asBytes(&version)) or version != DISK_CACHE_VERSION) return null;
-    if (!take(file, &off, std.mem.asBytes(&key_len)) or key_len != key.len or key_len > CACHE_KEY_BYTES) return null;
-    if (key_len > file.len - off) return null;
-    if (!std.mem.eql(u8, file[off..][0..key_len], key.bytes[0..key.len])) return null;
+    if (!take(payload, &off, std.mem.asBytes(&magic)) or magic != DISK_CACHE_MAGIC) return null;
+    if (!take(payload, &off, std.mem.asBytes(&version)) or version != DISK_CACHE_VERSION) return null;
+    if (!take(payload, &off, std.mem.asBytes(&key_len)) or key_len != key.len or key_len > CACHE_KEY_BYTES) return null;
+    if (key_len > payload.len - off) return null;
+    if (!std.mem.eql(u8, payload[off..][0..key_len], key.bytes[0..key.len])) return null;
     off += key_len;
     var incomplete: u8 = 0;
     var overlong: u64 = 0;
     var path_count: u32 = 0;
     var blob_len: u32 = 0;
-    if (!take(file, &off, std.mem.asBytes(&incomplete))) return null;
-    if (!take(file, &off, std.mem.asBytes(&overlong))) return null;
-    if (!take(file, &off, std.mem.asBytes(&path_count))) return null;
-    if (!take(file, &off, std.mem.asBytes(&blob_len))) return null;
+    if (!take(payload, &off, std.mem.asBytes(&incomplete))) return null;
+    if (!take(payload, &off, std.mem.asBytes(&overlong))) return null;
+    if (!take(payload, &off, std.mem.asBytes(&path_count))) return null;
+    if (!take(payload, &off, std.mem.asBytes(&blob_len))) return null;
     if (path_count > CACHE_MAX_PATHS or blob_len > CACHE_MAX_PATH_BYTES) return null;
-    if (blob_len > file.len - off) return null;
+    if (blob_len > payload.len - off) return null;
     const blob = std.heap.c_allocator.alloc(u8, blob_len) catch return null;
     errdefer std.heap.c_allocator.free(blob);
-    @memcpy(blob, file[off..][0..blob_len]);
+    @memcpy(blob, payload[off..][0..blob_len]);
     off += blob_len;
     const paths_byte_len = @as(usize, path_count) * @sizeOf(CachedPath);
-    if (paths_byte_len > file.len - off) {
+    if (paths_byte_len > payload.len - off) {
         std.heap.c_allocator.free(blob);
         return null;
     }
@@ -715,10 +919,10 @@ fn loadDiskSnapshotStaged(key: *const CacheKey) ?StagedSnapshot {
         return null;
     };
     errdefer std.heap.c_allocator.free(paths);
-    @memcpy(std.mem.sliceAsBytes(paths), file[off..][0..paths_byte_len]);
+    @memcpy(std.mem.sliceAsBytes(paths), payload[off..][0..paths_byte_len]);
     off += paths_byte_len;
     var dir_count: u32 = 0;
-    if (!take(file, &off, std.mem.asBytes(&dir_count)) or dir_count > CACHE_MAX_DIRECTORIES) {
+    if (!take(payload, &off, std.mem.asBytes(&dir_count)) or dir_count > CACHE_MAX_DIRECTORIES) {
         std.heap.c_allocator.free(blob);
         std.heap.c_allocator.free(paths);
         return null;
@@ -732,11 +936,11 @@ fn loadDiskSnapshotStaged(key: *const CacheKey) ?StagedSnapshot {
     var failed = false;
     while (initialized < dir_count) {
         var path_len: u32 = 0;
-        if (!take(file, &off, std.mem.asBytes(&path_len)) or path_len > 4096) {
+        if (!take(payload, &off, std.mem.asBytes(&path_len)) or path_len > 4096) {
             failed = true;
             break;
         }
-        if (path_len > file.len - off or @sizeOf(DirectoryStamp) > file.len - off - path_len) {
+        if (path_len > payload.len - off or @sizeOf(DirectoryStamp) > payload.len - off - path_len) {
             failed = true;
             break;
         }
@@ -744,15 +948,22 @@ fn loadDiskSnapshotStaged(key: *const CacheKey) ?StagedSnapshot {
             failed = true;
             break;
         };
-        @memcpy(dir_path[0..path_len], file[off..][0..path_len]);
+        @memcpy(dir_path[0..path_len], payload[off..][0..path_len]);
         off += path_len;
         var stamp: DirectoryStamp = undefined;
-        @memcpy(std.mem.asBytes(&stamp), file[off..][0..@sizeOf(DirectoryStamp)]);
+        @memcpy(std.mem.asBytes(&stamp), payload[off..][0..@sizeOf(DirectoryStamp)]);
         off += @sizeOf(DirectoryStamp);
         directories[initialized] = .{ .path = dir_path, .expected = statFromStamp(stamp) };
         initialized += 1;
     }
     if (failed) {
+        for (directories[0..initialized]) |directory| std.heap.c_allocator.free(directory.path);
+        std.heap.c_allocator.free(directories);
+        std.heap.c_allocator.free(blob);
+        std.heap.c_allocator.free(paths);
+        return null;
+    }
+    if (off != payload.len) {
         for (directories[0..initialized]) |directory| std.heap.c_allocator.free(directory.path);
         std.heap.c_allocator.free(directories);
         std.heap.c_allocator.free(blob);
@@ -767,65 +978,6 @@ fn loadDiskSnapshotStaged(key: *const CacheKey) ?StagedSnapshot {
         .incomplete = incomplete != 0,
         .overlong = @intCast(overlong),
     };
-}
-
-fn loadDiskSnapshot(cache: *SnapshotCache, key: *const CacheKey) bool {
-    // Caller holds cache.mu. Staged load does the file IO into owned
-    // allocations (no shared mutation); install here is a pointer swap.
-    var staged = loadDiskSnapshotStaged(key) orelse return false;
-    errdefer freeStagedSnapshot(&staged);
-    installStagedSnapshot(cache, key, &staged);
-    return true;
-}
-
-fn buildAncestorDirectories(workspace_root: []const u8, paths: []const []const u8) ?[]CachedDirectory {
-    var captured: std.ArrayListUnmanaged(CapturedDirectory) = .empty;
-    defer drainValidationDirectories(&captured);
-    const root_copy = std.heap.c_allocator.dupeZ(u8, "") catch return null;
-    captured.append(std.heap.c_allocator, .{
-        .path = root_copy,
-        .before = std.mem.zeroes(c.struct_stat),
-    }) catch {
-        std.heap.c_allocator.free(root_copy);
-        return null;
-    };
-
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer {
-        var it = seen.keyIterator();
-        while (it.next()) |k| std.heap.c_allocator.free(k.*);
-        seen.deinit(std.heap.c_allocator);
-    }
-    const empty_key = std.heap.c_allocator.dupe(u8, "") catch return null;
-    seen.put(std.heap.c_allocator, empty_key, {}) catch {
-        std.heap.c_allocator.free(empty_key);
-        return null;
-    };
-
-    for (paths) |path| {
-        var start: usize = 0;
-        while (start < path.len) {
-            const slash = std.mem.indexOfScalarPos(u8, path, start, '/') orelse break;
-            const prefix = path[0..slash];
-            if (seen.get(prefix) == null) {
-                const owned_key = std.heap.c_allocator.dupe(u8, prefix) catch return null;
-                seen.put(std.heap.c_allocator, owned_key, {}) catch {
-                    std.heap.c_allocator.free(owned_key);
-                    return null;
-                };
-                const owned_path = std.heap.c_allocator.dupeZ(u8, prefix) catch return null;
-                captured.append(std.heap.c_allocator, .{
-                    .path = owned_path,
-                    .before = std.mem.zeroes(c.struct_stat),
-                }) catch {
-                    std.heap.c_allocator.free(owned_path);
-                    return null;
-                };
-            }
-            start = slash + 1;
-        }
-    }
-    return buildCachedDirectories(workspace_root, captured.items);
 }
 
 fn wipeDiskSnapshots() void {
@@ -882,23 +1034,23 @@ fn appendStatStamp(key: *CacheKey, st: c.struct_stat) bool {
     return key.append(std.mem.asBytes(&stamp));
 }
 
-fn makeGitCacheKey(
+fn makeGitRawCacheKey(
     workspace_root: []const u8,
-    ignored_names: []const []const u8,
-    include_hidden: bool,
-    candidate_cap: usize,
-    sort_paths: bool,
+    git_executable: []const u8,
+    only_untracked: bool,
+    include_untracked: bool,
+    stdout_limit: usize,
 ) ?CacheKey {
     var key = CacheKey{};
-    const flags = [_]u8{ 3, 1, @intFromBool(include_hidden), @intFromBool(sort_paths) };
-    if (!key.append(&flags) or
+    const flags = [_]u8{ 4, @intFromBool(only_untracked), @intFromBool(include_untracked) };
+    if (!key.append(CACHE_ABI_TAG) or
+        !key.append(UPSTREAM_FINGERPRINT) or
+        !key.append(&flags) or
         !key.appendU64(workspace_root.len) or
         !key.append(workspace_root) or
-        !key.appendU64(candidate_cap) or
-        !key.appendU64(ignored_names.len)) return null;
-    for (ignored_names) |ignored| {
-        if (!key.appendU64(ignored.len) or !key.append(ignored)) return null;
-    }
+        !key.appendU64(git_executable.len) or
+        !key.append(git_executable) or
+        !key.appendU64(stdout_limit)) return null;
 
     var git_dir_buf: [768]u8 = undefined;
     const git_dir = std.fmt.bufPrintZ(&git_dir_buf, "{s}/.git", .{workspace_root}) catch return null;
@@ -921,106 +1073,196 @@ fn makeGitCacheKey(
     return key;
 }
 
-/// Returns true if a git-list snapshot was materialized into `out_paths`.
-pub fn takeGitFiles(
-    arena: std.mem.Allocator,
+fn cacheKeysEqual(left: *const CacheKey, right: *const CacheKey) bool {
+    return left.len == right.len and std.mem.eql(u8, left.bytes[0..left.len], right.bytes[0..right.len]);
+}
+
+pub const GitRawSnapshot = opaque {};
+
+const GitRawSnapshotState = struct {
+    key: CacheKey,
+    workspace_root: []u8,
+    git_executable: []u8,
+    only_untracked: bool,
+    include_untracked: bool,
+    stdout_limit: usize,
+    hit: bool = false,
+};
+
+fn gitRawSnapshotState(snapshot: *GitRawSnapshot) *GitRawSnapshotState {
+    return @ptrCast(@alignCast(snapshot));
+}
+
+fn refreshGitRawKey(state: *const GitRawSnapshotState) ?CacheKey {
+    return makeGitRawCacheKey(
+        state.workspace_root,
+        state.git_executable,
+        state.only_untracked,
+        state.include_untracked,
+        state.stdout_limit,
+    );
+}
+
+fn envIsSet(name: [*:0]const u8) bool {
+    const value = std.c.getenv(name) orelse return false;
+    return value[0] != 0;
+}
+
+pub fn beginGitRawSnapshot(
     workspace_root: []const u8,
-    ignored_names: []const []const u8,
-    include_hidden: bool,
-    candidate_cap: usize,
-    sort_paths: bool,
-    out_paths: *std.ArrayList([]const u8),
-    out_overlong: *usize,
-    out_incomplete: *bool,
-) bool {
+    git_executable: []const u8,
+    only_untracked: bool,
+    include_untracked: bool,
+    stdout_limit: usize,
+) Error!?*GitRawSnapshot {
     last_cache_hit.store(false, .release);
-    if (comptime builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return false;
+    if (comptime builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return null;
     const off = std.c.getenv("FX_NO_COMPANION");
-    if (off != null and off.?[0] != 0) return false;
+    if (off != null and off.?[0] != 0) return null;
     const no_cache = std.c.getenv("FX_COMPANION_NO_CACHE");
-    if (no_cache != null and no_cache.?[0] != 0) return false;
-    const key = makeGitCacheKey(workspace_root, ignored_names, include_hidden, candidate_cap, sort_paths) orelse return false;
+    if (no_cache != null and no_cache.?[0] != 0) return null;
+    // --others / --cached --others depend on working-tree directory state,
+    // .gitignore, info/exclude, and global excludes. Until that entire identity
+    // is captured, only cache the tracked `git ls-files --cached -z` primitive.
+    if (only_untracked or include_untracked) return null;
+    // Alternate repository/index routing changes git ls-files semantics without
+    // necessarily changing .git/index. Fail closed instead of trying to mirror
+    // Git's full environment-resolution policy in the cache layer.
+    if (envIsSet("GIT_INDEX_FILE") or envIsSet("GIT_DIR") or
+        envIsSet("GIT_WORK_TREE") or envIsSet("GIT_COMMON_DIR")) return null;
+    const key = makeGitRawCacheKey(workspace_root, git_executable, only_untracked, include_untracked, stdout_limit) orelse return null;
+    const state = std.heap.c_allocator.create(GitRawSnapshotState) catch return error.OutOfMemory;
+    errdefer std.heap.c_allocator.destroy(state);
+    const root_copy = std.heap.c_allocator.dupe(u8, workspace_root) catch return error.OutOfMemory;
+    errdefer std.heap.c_allocator.free(root_copy);
+    const executable_copy = std.heap.c_allocator.dupe(u8, git_executable) catch return error.OutOfMemory;
+    state.* = .{
+        .key = key,
+        .workspace_root = root_copy,
+        .git_executable = executable_copy,
+        .only_untracked = only_untracked,
+        .include_untracked = include_untracked,
+        .stdout_limit = stdout_limit,
+    };
+    return @ptrCast(state);
+}
+
+pub fn discardGitRawSnapshot(snapshot: *GitRawSnapshot) void {
+    const state = gitRawSnapshotState(snapshot);
+    std.heap.c_allocator.free(state.workspace_root);
+    std.heap.c_allocator.free(state.git_executable);
+    std.heap.c_allocator.destroy(state);
+}
+
+fn rawFromCache(cache: *const SnapshotCache, arena: std.mem.Allocator) ?[]u8 {
+    const blob = cache.blob orelse return null;
+    const paths = cache.paths orelse return null;
+    if (paths.len != 1 or paths[0].offset != 0 or paths[0].len != blob.len) return null;
+    return arena.dupe(u8, blob) catch null;
+}
+
+/// Returns cached raw stdout from git ls-files. Upstream still owns parsing,
+/// candidate caps, sorting, source selection, and the empty-result fallback.
+/// Identity is checked both before and after materialization to prevent a
+/// concurrent index/HEAD mutation from turning a cache hit into stale output.
+pub fn takeGitRaw(
+    snapshot: *GitRawSnapshot,
+    arena: std.mem.Allocator,
+    stop_requested: ?*std.atomic.Value(bool),
+) ?[]u8 {
+    const state = gitRawSnapshotState(snapshot);
+    if (stop_requested) |stop| if (stop.load(.seq_cst)) return null;
+    const key = &state.key;
     const cache = getGitCache();
     cache.mu.lock();
-    if (cacheKeyMatches(cache, &key)) {
-        const materialized = materializeSnapshot(cache, arena, out_paths, out_overlong);
-        if (materialized) |_| {
-            out_incomplete.* = cache.incomplete;
-            last_cache_hit.store(true, .release);
+    if (cacheKeyMatches(cache, key)) {
+        if (rawFromCache(cache, arena)) |raw| {
             cache.mu.unlock();
-            return true;
-        } else |_| {}
+            if (stop_requested) |stop| if (stop.load(.seq_cst)) return null;
+            const after = refreshGitRawKey(state) orelse return null;
+            if (!cacheKeysEqual(key, &after)) return null;
+            state.hit = true;
+            last_cache_hit.store(true, .release);
+            return raw;
+        }
     }
     cache.mu.unlock();
 
-    // Git discovery is the production path for normal workspaces. Reuse its
-    // identity-keyed snapshot across fx processes just like recursive walks,
-    // while leaving the stock git command and parser as the cold fallback.
-    if (loadDiskSnapshotStaged(&key)) |staged_value| {
+    const had_disk_snapshot = diskSnapshotExists(key.bytes[0..key.len]);
+    if (loadDiskSnapshotStaged(key)) |staged_value| {
         var staged = staged_value;
         var installed = false;
         defer if (!installed) freeStagedSnapshot(&staged);
-        // Git snapshots do not carry recursive directory validation records.
-        // Reject any other snapshot shape rather than treating it as a Git
-        // result by accident.
-        if (staged.directories.len != 0) return false;
+        if (staged.directories.len != 0 or staged.paths.len != 1 or
+            staged.paths[0].offset != 0 or staged.paths[0].len != staged.blob.len)
+        {
+            deleteDiskSnapshot(key.bytes[0..key.len]);
+            return null;
+        }
 
         cache.mu.lock();
-        installStagedSnapshot(cache, &key, &staged);
+        installStagedSnapshot(cache, key, &staged);
         installed = true;
-        const materialized = materializeSnapshot(cache, arena, out_paths, out_overlong);
-        if (materialized) |_| {
-            out_incomplete.* = cache.incomplete;
-            last_cache_hit.store(true, .release);
-            cache.mu.unlock();
-            return true;
-        } else |_| {
+        const raw = rawFromCache(cache, arena);
+        if (raw == null) {
             cache.clearLocked();
             cache.mu.unlock();
-            return false;
+            deleteDiskSnapshot(key.bytes[0..key.len]);
+            return null;
         }
+        cache.mu.unlock();
+        if (stop_requested) |stop| if (stop.load(.seq_cst)) return null;
+        const after = refreshGitRawKey(state) orelse return null;
+        if (!cacheKeysEqual(key, &after)) return null;
+        state.hit = true;
+        last_cache_hit.store(true, .release);
+        return raw.?;
     }
-    return false;
+    if (had_disk_snapshot) deleteDiskSnapshot(key.bytes[0..key.len]);
+    return null;
 }
 
-pub fn storeGitFiles(
-    workspace_root: []const u8,
-    ignored_names: []const []const u8,
-    include_hidden: bool,
-    candidate_cap: usize,
-    sort_paths: bool,
-    files: []const []const u8,
-    incomplete: bool,
-    skipped_overlong: usize,
+/// Publishes raw git stdout only if repository identity is unchanged from the
+/// pre-command token captured by beginGitRawSnapshot().
+pub fn finishGitRawSnapshot(
+    snapshot: *GitRawSnapshot,
+    raw: []const u8,
 ) void {
-    if (comptime builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return;
-    const off = std.c.getenv("FX_NO_COMPANION");
-    if (off != null and off.?[0] != 0) return;
-    const no_cache = std.c.getenv("FX_COMPANION_NO_CACHE");
-    if (no_cache != null and no_cache.?[0] != 0) return;
-    const key = makeGitCacheKey(workspace_root, ignored_names, include_hidden, candidate_cap, sort_paths) orelse return;
-    const built = buildCachedPaths(files) orelse return;
+    const state = gitRawSnapshotState(snapshot);
+    if (state.hit or raw.len > state.stdout_limit or raw.len > CACHE_MAX_PATH_BYTES or raw.len > std.math.maxInt(u32)) return;
+    const after = refreshGitRawKey(state) orelse return;
+    if (!cacheKeysEqual(&state.key, &after)) return;
+
+    const blob = std.heap.c_allocator.dupe(u8, raw) catch return;
+    var keep_blob = false;
+    defer if (!keep_blob) std.heap.c_allocator.free(blob);
+    const paths = std.heap.c_allocator.alloc(CachedPath, 1) catch return;
+    var keep_paths = false;
+    defer if (!keep_paths) std.heap.c_allocator.free(paths);
+    paths[0] = .{ .offset = 0, .len = @intCast(raw.len) };
     const no_directories: []const CachedDirectory = &.{};
     persistDiskSnapshotStaged(
-        key.bytes[0..key.len],
-        built.blob,
-        built.paths,
+        state.key.bytes[0..state.key.len],
+        blob,
+        paths,
         no_directories,
-        incomplete,
-        skipped_overlong,
+        false,
+        0,
     );
     const cache = getGitCache();
     cache.mu.lock();
     defer cache.mu.unlock();
     cache.clearLocked();
-    @memcpy(cache.key[0..key.len], key.bytes[0..key.len]);
-    cache.key_len = key.len;
-    cache.blob = built.blob;
-    cache.paths = built.paths;
+    @memcpy(cache.key[0..state.key.len], state.key.bytes[0..state.key.len]);
+    cache.key_len = state.key.len;
+    cache.blob = blob;
+    cache.paths = paths;
     cache.directories = null;
-    cache.incomplete = incomplete;
-    cache.overlong = skipped_overlong;
+    cache.incomplete = false;
+    cache.overlong = 0;
     cache.valid = true;
+    keep_blob = true;
+    keep_paths = true;
 }
 
 pub const CacheObservation = struct {
@@ -1083,581 +1325,18 @@ pub fn snapshotStats() SnapshotStats {
     };
 }
 
-pub const StockSnapshot = opaque {};
-
-const StockSnapshotState = struct {
-    key: CacheKey,
-    directories: []CachedDirectory,
-    owns_directories: bool = true,
-};
-
-fn stockSnapshotState(snapshot: *StockSnapshot) *StockSnapshotState {
-    return @ptrCast(@alignCast(snapshot));
-}
-
-pub fn beginStockSnapshot(
-    workspace_root: []const u8,
-    ignored_names: []const []const u8,
-    ignored_paths: ?*const std.StringHashMapUnmanaged(void),
-    target_files: bool,
-    include_hidden: bool,
-    candidate_cap: usize,
-    max_relative_path_bytes: usize,
-    stop_requested: ?*std.atomic.Value(bool),
-) Error!?*StockSnapshot {
-    _ = stop_requested;
-    if (ignored_paths != null) return null;
-    const no_cache = std.c.getenv("FX_COMPANION_NO_CACHE");
-    if (no_cache != null and no_cache.?[0] != 0) return null;
-    const key = makeCacheKey(
-        workspace_root,
-        ignored_names,
-        target_files,
-        include_hidden,
-        candidate_cap,
-        max_relative_path_bytes,
-    ) orelse return null;
-
-    const state = std.heap.c_allocator.create(StockSnapshotState) catch return error.OutOfMemory;
-    // Directories are filled from stock's result in finishStockSnapshot. A
-    // second full-tree capture here was the capped-cold regression.
-    state.* = .{ .key = key, .directories = &.{}, .owns_directories = false };
-    return @ptrCast(state);
-}
-
-pub fn discardStockSnapshot(snapshot: *StockSnapshot) void {
-    const state = stockSnapshotState(snapshot);
-    if (state.owns_directories) freeCachedDirectories(state.directories);
-    std.heap.c_allocator.destroy(state);
-}
-
-pub fn finishStockSnapshot(
-    snapshot: *StockSnapshot,
-    workspace_root: []const u8,
-    stock_paths: []const []const u8,
-    skipped_overlong: usize,
-    incomplete: bool,
-) void {
-    const state = stockSnapshotState(snapshot);
-    if (stock_paths.len > 1) {
-        for (stock_paths[1..], stock_paths[0 .. stock_paths.len - 1]) |current, previous| {
-            if (std.mem.lessThan(u8, current, previous)) return;
-        }
-    }
-    const directories = buildAncestorDirectories(workspace_root, stock_paths) orelse return;
-    var keep_directories = false;
-    defer if (!keep_directories) freeCachedDirectories(directories);
-    if (!validateDirectorySnapshot(directories, workspace_root)) return;
-    const built_paths = buildCachedPaths(stock_paths) orelse return;
-
-    const cache = getSnapshotCache();
-    cache.mu.lock();
-    defer cache.mu.unlock();
-    cache.clearLocked();
-    @memcpy(cache.key[0..state.key.len], state.key.bytes[0..state.key.len]);
-    cache.key_len = state.key.len;
-    cache.blob = built_paths.blob;
-    cache.paths = built_paths.paths;
-    cache.directories = directories;
-    cache.incomplete = incomplete;
-    cache.overlong = skipped_overlong;
-    cache.valid = true;
-    keep_directories = true;
-    persistDiskSnapshot(cache);
-}
-
 fn isHiddenName(name: []const u8) bool {
     return name.len > 1 and name[0] == '.';
 }
 
-/// True when the accelerated walk will actually engage on this machine.
-/// Drives the BOOSTED badge in the UI header.
+/// True when the accelerator is supported and enabled on this machine.
 pub fn active() bool {
     if (comptime builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return false;
     const off = std.c.getenv("FX_NO_COMPANION");
     return off == null or off.?[0] == 0;
 }
 
-/// Renders "✦ BOOSTED" with a smooth cyan→violet→magenta per-character
-/// truecolor gradient. Returns an empty slice when inactive or the buffer
-/// is too small, so callers can append it unconditionally. `buf` must be
-/// at least 256 bytes.
-pub fn boostedBadge(buf: []u8) []const u8 {
-    if (!active()) return buf[0..0];
-    const label = "\u{2726} BOOSTED";
-    // Count codepoints so multi-byte chars stay under one escape.
-    var nchars: usize = 0;
-    var pos: usize = 0;
-    while (pos < label.len) {
-        pos += std.unicode.utf8ByteSequenceLength(label[pos]) catch 1;
-        nchars += 1;
-    }
-    var w: usize = 0;
-    var idx: usize = 0;
-    var ci: usize = 0;
-    while (idx < label.len) : (ci += 1) {
-        const cl = std.unicode.utf8ByteSequenceLength(label[idx]) catch 1;
-        const ch = label[idx .. idx + cl];
-        const t = @as(f64, @floatFromInt(ci)) / @as(f64, @floatFromInt(nchars - 1));
-        // three-stop gradient: teal -> violet -> magenta
-        const r: usize = @intFromFloat(if (t < 0.5) 64 + t * 2 * 116 else 180 + (t - 0.5) * 2 * 75);
-        const g: usize = @intFromFloat(if (t < 0.5) 224 - t * 2 * 104 else 120 - (t - 0.5) * 2 * 40);
-        const b: usize = @intFromFloat(200 + t * 55);
-        const written = std.fmt.bufPrint(buf[w..], "\x1b[38;2;{d};{d};{d}m", .{ r, g, b }) catch return buf[0..0];
-        w += written.len;
-        if (w + cl >= buf.len) return buf[0..0];
-        @memcpy(buf[w .. w + cl], ch);
-        w += cl;
-        idx += cl;
-    }
-    const tail = std.fmt.bufPrint(buf[w..], "\x1b[0m", .{}) catch return buf[0..0];
-    w += tail.len;
-    // Leading space keeps the badge visually separated from the version label.
-    if (w + 1 < buf.len) {
-        std.mem.copyBackwards(u8, buf[1 .. w + 1], buf[0..w]);
-        buf[0] = ' ';
-        w += 1;
-    }
-    return buf[0..w];
-}
-
-// ---------------------------------------------------------------- benchmark
-
-extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
-
-pub fn executablePathAlloc(alloc: std.mem.Allocator) ![]u8 {
-    var size: u32 = 1;
-    var probe: [1]u8 = undefined;
-    _ = _NSGetExecutablePath(&probe, &size);
-    if (size == 0) size = 4096;
-    const buf = try alloc.alloc(u8, size);
-    errdefer alloc.free(buf);
-    var live_size = size;
-    if (_NSGetExecutablePath(buf.ptr, &live_size) != 0) return error.CompanionUnavailable;
-    const len = std.mem.indexOfScalar(u8, buf, 0) orelse @min(live_size, buf.len);
-    return alloc.realloc(buf, len) catch buf[0..len];
-}
-
-extern "c" fn opendir(path: [*]const u8) ?*anyopaque;
-extern "c" fn readdir(dirp: *anyopaque) ?[*]u8;
-extern "c" fn closedir(dirp: *anyopaque) c_int;
-extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
-extern "c" fn usleep(microseconds: c_uint) c_int;
-
-const Timespec = extern struct { sec: isize, nsec: isize };
-fn nowNs() u64 {
-    var ts: Timespec = undefined;
-    _ = clock_gettime(4, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
-
-/// Adaptive duration formatting: ns below 1 µs, µs below 1 ms, then ms.
-fn fmtDur(ns: u64, buf: []u8) []const u8 {
-    const f: f64 = @floatFromInt(ns);
-    if (ns < 1_000) return std.fmt.bufPrint(buf, "{d:.0} ns", .{f}) catch "?";
-    if (ns < 1_000_000) return std.fmt.bufPrint(buf, "{d:.1} \u{00b5}s", .{f / 1e3}) catch "?";
-    return std.fmt.bufPrint(buf, "{d:.2} ms", .{f / 1e6}) catch "?";
-}
-
-/// Median via insertion sort on a small copy.
-fn medianOf(times: []const u64) u64 {
-    var tmp: [16]u64 = undefined;
-    const n = @min(times.len, tmp.len);
-    @memcpy(tmp[0..n], times[0..n]);
-    std.mem.sort(u64, tmp[0..n], {}, struct {
-        fn lt(_: void, x: u64, y: u64) bool {
-            return x < y;
-        }
-    }.lt);
-    return tmp[n / 2];
-}
-
-fn minOf(times: []const u64) u64 {
-    var m: u64 = std.math.maxInt(u64);
-    for (times) |t| m = @min(m, t);
-    return m;
-}
-
-/// Single-threaded libc readdir DFS used as an independent count-only
-/// comparison. It does not allocate or sort paths and is not labeled stock.
-fn referenceWalk(
-    arena: std.mem.Allocator,
-    root: []const u8,
-    out_count: *usize,
-) !void {
-    var stack: std.ArrayList([]const u8) = .empty;
-    try stack.append(arena, try arena.dupeZ(u8, ""));
-    defer {
-        for (stack.items) |item| arena.free(item);
-        stack.deinit(arena);
-    }
-    var pathbuf: [4096]u8 = undefined;
-    while (stack.pop()) |prefix| {
-        const plen = if (prefix.len == 0)
-            (std.fmt.bufPrintZ(&pathbuf, "{s}", .{root}) catch continue).len
-        else
-            (std.fmt.bufPrintZ(&pathbuf, "{s}/{s}", .{ root, prefix }) catch continue).len;
-        const dp = opendir(pathbuf[0..plen].ptr) orelse continue;
-        while (true) {
-            const dent = readdir(dp) orelse break;
-            const reclen = std.mem.readInt(u16, dent[16..18], .little);
-            if (reclen == 0) break;
-            const namlen: usize = std.mem.readInt(u16, dent[18..20], .little);
-            const dtype = dent[20];
-            const name = dent[21 .. 21 + namlen];
-            if (name.len == 1 and name[0] == '.') continue;
-            if (name.len == 2 and name[0] == '.' and name[1] == '.') continue;
-            if (dtype == DT_REG or dtype == DT_LNK) {
-                // Count the same regular-file and symlink kinds fx emits.
-                out_count.* += 1;
-                continue;
-            }
-            if (dtype != DT_DIR) continue;
-            if (isHiddenName(name)) continue;
-            if (isIgnoredName(&.{ ".git", ".zig-cache", "zig-out", "node_modules", ".next", "dist", "build", "coverage" }, name)) continue;
-            const child = if (prefix.len == 0)
-                try arena.dupeZ(u8, name)
-            else
-                try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ prefix, name }, 0);
-            try stack.append(arena, child);
-        }
-        _ = closedir(dp);
-        arena.free(prefix);
-    }
-}
-
-const BenchmarkPair = struct {
-    cold_ns: u64,
-    warm_ns: u64,
-    validation_ns: u64,
-    files: usize,
-    walk: WalkObservation,
-};
-
-const interactive_probe_cap: usize = 10_000;
-const interactive_probe_budget_ms: usize = 100;
-
-const ProbeStatus = enum {
-    complete,
-    incomplete,
-    timed_out,
-    failed,
-};
-
-const InteractiveProbe = struct {
-    status: ProbeStatus,
-    elapsed_ns: u64,
-    files: usize = 0,
-    overlong: usize = 0,
-    failure: ?anyerror = null,
-    walk: WalkObservation = .{ .directories = 0, .getdirentries_calls = 0, .dirent_bytes = 0, .entries_seen = 0 },
-};
-
-const ProbeDeadline = struct {
-    done: std.atomic.Value(bool) = .init(false),
-    stop: std.atomic.Value(bool) = .init(false),
-};
-
-fn probeDeadlineMain(deadline: *ProbeDeadline) void {
-    for (0..interactive_probe_budget_ms) |_| {
-        if (deadline.done.load(.acquire)) return;
-        _ = usleep(1000);
-    }
-    if (!deadline.done.load(.acquire)) deadline.stop.store(true, .seq_cst);
-}
-
-fn interactiveProbe(workspace_root: []const u8) InteractiveProbe {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena_state.deinit();
-    var paths: std.ArrayList([]const u8) = .empty;
-    var overlong: usize = 0;
-    var exact = false;
-    var deadline = ProbeDeadline{};
-    const timer = std.Thread.spawn(.{}, probeDeadlineMain, .{&deadline}) catch return .{
-        .status = .failed,
-        .elapsed_ns = 0,
-        .failure = error.CompanionUnavailable,
-    };
-
-    const started = nowNs();
-    const incomplete = walkPaths(
-        arena_state.allocator(),
-        workspace_root,
-        &.{ ".git", ".zig-cache", "zig-out", "node_modules", ".next", "dist", "build", "coverage" },
-        null,
-        true,
-        false,
-        interactive_probe_cap,
-        4096,
-        &deadline.stop,
-        &paths,
-        &overlong,
-        &exact,
-        false,
-    ) catch |err| {
-        deadline.done.store(true, .release);
-        timer.join();
-        return .{
-            .status = if (err == error.Canceled and deadline.stop.load(.seq_cst)) .timed_out else .failed,
-            .elapsed_ns = nowNs() - started,
-            .failure = err,
-        };
-    };
-    deadline.done.store(true, .release);
-    timer.join();
-    return .{
-        .status = if (incomplete) .incomplete else .complete,
-        .elapsed_ns = nowNs() - started,
-        .files = paths.items.len,
-        .overlong = overlong,
-        .walk = lastWalkObservation(),
-    };
-}
-
-fn writeResponsiveProfile(
-    arena: std.mem.Allocator,
-    workspace_root: []const u8,
-    probe: InteractiveProbe,
-    out: *std.ArrayListUnmanaged(u8),
-) !void {
-    var aw: std.Io.Writer.Allocating = .fromArrayList(arena, out);
-    const w = &aw.writer;
-    try w.writeAll("fx-companion profile\n\n");
-    try w.print("  tree          {s}\n", .{workspace_root});
-    try w.print("  method        responsive bounded probe ({d} paths or {d} ms)\n", .{
-        interactive_probe_cap,
-        interactive_probe_budget_ms,
-    });
-    try w.writeAll("  engagement    recursive walkPaths only; production git ls-files is not this view\n");
-    var b: [4][48]u8 = undefined;
-    switch (probe.status) {
-        .incomplete => {
-            try w.print("  result        path bound reached; full in-session profile skipped\n", .{});
-            try w.print("  bounded cold  {s} single sample · paths={d} incomplete=true\n", .{
-                fmtDur(probe.elapsed_ns, &b[0]),
-                probe.files,
-            });
-            try w.writeAll("  correctness   no stock equivalence or speedup claimed for the bounded subset\n");
-        },
-        .timed_out => {
-            try w.print("  result        {d} ms responsiveness budget reached; full profile skipped\n", .{interactive_probe_budget_ms});
-            try w.print("  bounded cold  {s} before cancellation\n", .{fmtDur(probe.elapsed_ns, &b[0])});
-            try w.writeAll("  correctness   no partial result or speedup claimed\n");
-        },
-        .failed => {
-            try w.print("  result        accelerator probe stopped safely: {s}\n", .{@errorName(probe.failure orelse error.CompanionUnavailable)});
-            try w.writeAll("  correctness   no partial result or speedup claimed\n");
-        },
-        .complete => {
-            try w.print("  bounded cold  {s} single sample · paths={d} complete=true\n", .{
-                fmtDur(probe.elapsed_ns, &b[0]),
-                probe.files,
-            });
-            try w.writeAll("  result        full snapshot profile skipped by the responsiveness guard\n");
-            try w.writeAll("  correctness   cold result complete; no warm speedup claimed\n");
-        },
-    }
-    if (probe.walk.getdirentries_calls > 0) {
-        try w.print("  cold syscalls getdirentries={d} dirent_bytes={d} dirs={d} entries={d}\n", .{
-            probe.walk.getdirentries_calls,
-            probe.walk.dirent_bytes,
-            probe.walk.directories,
-            probe.walk.entries_seen,
-        });
-    }
-    try w.writeAll("\n  The interactive guard keeps the terminal responsive; use the repository benchmark runner for full seven-round results.\n");
-    try w.writeAll("  Network/model timing is not synthesized: no paid request is made.\n");
-    try w.writeAll("  FX_COMPANION_NO_CACHE=1 disables snapshots; FX_NO_COMPANION=1 disables all acceleration.\n");
-    out.* = aw.toArrayList();
-}
-
-fn benchmarkPair(workspace_root: []const u8) !BenchmarkPair {
-    clearSnapshotCache();
-    var cold_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer cold_arena.deinit();
-    var warm_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer warm_arena.deinit();
-    var cold_paths: std.ArrayList([]const u8) = .empty;
-    var warm_paths: std.ArrayList([]const u8) = .empty;
-    var cold_overlong: usize = 0;
-    var warm_overlong: usize = 0;
-    var cold_exact = false;
-    var warm_exact = false;
-
-    const cold_started = nowNs();
-    const cold_incomplete = try walkPaths(
-        cold_arena.allocator(),
-        workspace_root,
-        &.{ ".git", ".zig-cache", "zig-out", "node_modules", ".next", "dist", "build", "coverage" },
-        null,
-        true,
-        false,
-        std.math.maxInt(usize),
-        4096,
-        null,
-        &cold_paths,
-        &cold_overlong,
-        &cold_exact,
-        true,
-    );
-    const cold_ns = nowNs() - cold_started;
-    const walk = lastWalkObservation();
-
-    const warm_started = nowNs();
-    const warm_incomplete = try walkPaths(
-        warm_arena.allocator(),
-        workspace_root,
-        &.{ ".git", ".zig-cache", "zig-out", "node_modules", ".next", "dist", "build", "coverage" },
-        null,
-        true,
-        false,
-        std.math.maxInt(usize),
-        4096,
-        null,
-        &warm_paths,
-        &warm_overlong,
-        &warm_exact,
-        true,
-    );
-    const warm_ns = nowNs() - warm_started;
-    const cache_observation = lastCacheObservation();
-    if (!cold_exact or !warm_exact or cold_incomplete != warm_incomplete or
-        cold_overlong != warm_overlong or cold_paths.items.len != warm_paths.items.len)
-    {
-        return error.BenchmarkMismatch;
-    }
-    if (!cache_observation.hit) return error.CacheUnavailable;
-    for (cold_paths.items, warm_paths.items) |cold_path, warm_path| {
-        if (!std.mem.eql(u8, cold_path, warm_path)) return error.BenchmarkMismatch;
-    }
-    return .{
-        .cold_ns = cold_ns,
-        .warm_ns = warm_ns,
-        .validation_ns = cache_observation.validation_ns,
-        .files = cold_paths.items.len,
-        .walk = walk,
-    };
-}
-
-/// Profiles cold traversal, warm snapshot validation/materialization, and a
-/// count-only single-thread readdir comparison. One pair warms the filesystem;
-/// seven fresh-arena timed rounds follow, with alternating measurement order.
-pub fn runBenchmark(
-    arena: std.mem.Allocator,
-    workspace_root: []const u8,
-    out: *std.ArrayListUnmanaged(u8),
-) !void {
-    const preflight = interactiveProbe(workspace_root);
-    const no_cache = std.c.getenv("FX_COMPANION_NO_CACHE");
-    if (preflight.status != .complete or (no_cache != null and no_cache.?[0] != 0)) {
-        return writeResponsiveProfile(arena, workspace_root, preflight, out);
-    }
-
-    _ = benchmarkPair(workspace_root) catch {
-        return writeResponsiveProfile(arena, workspace_root, preflight, out);
-    };
-    var aw: std.Io.Writer.Allocating = .fromArrayList(arena, out);
-    const w = &aw.writer;
-
-    const rounds: usize = 7;
-    var cold_times: [rounds]u64 = undefined;
-    var warm_times: [rounds]u64 = undefined;
-    var validation_times: [rounds]u64 = undefined;
-    var materialize_times: [rounds]u64 = undefined;
-    var ref_times: [rounds]u64 = undefined;
-    var file_count: usize = 0;
-    var ref_count: usize = 0;
-    var walk: WalkObservation = undefined;
-    for (0..rounds) |i| {
-        if (i % 2 == 0) {
-            var ref_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-            ref_count = 0;
-            const ref_started = nowNs();
-            referenceWalk(ref_arena.allocator(), workspace_root, &ref_count) catch {
-                ref_arena.deinit();
-                return;
-            };
-            ref_times[i] = nowNs() - ref_started;
-            ref_arena.deinit();
-        }
-        const pair = benchmarkPair(workspace_root) catch |err| {
-            try w.print("profile failed: {s}\n", .{@errorName(err)});
-            out.* = aw.toArrayList();
-            return;
-        };
-        cold_times[i] = pair.cold_ns;
-        warm_times[i] = pair.warm_ns;
-        validation_times[i] = pair.validation_ns;
-        materialize_times[i] = pair.warm_ns -| pair.validation_ns;
-        file_count = pair.files;
-        walk = pair.walk;
-        if (i % 2 != 0) {
-            var ref_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-            ref_count = 0;
-            const ref_started = nowNs();
-            referenceWalk(ref_arena.allocator(), workspace_root, &ref_count) catch {
-                ref_arena.deinit();
-                return;
-            };
-            ref_times[i] = nowNs() - ref_started;
-            ref_arena.deinit();
-        }
-    }
-
-    const cold_med = medianOf(&cold_times);
-    const warm_med = medianOf(&warm_times);
-    const repeat_speedup = @as(f64, @floatFromInt(cold_med)) /
-        @as(f64, @floatFromInt(warm_med));
-    const stats = snapshotStats();
-
-    try w.writeAll("fx-companion profile\n\n");
-    try w.print("  tree          {s}\n", .{workspace_root});
-    try w.writeAll("  engagement    this view is recursive walkPaths only; git ls-files (production discover) is not measured here\n");
-    try w.writeAll("  method        1 warmup + 7 rounds, fresh arenas, alternating order\n");
-    try w.print("  correctness   cold={d} warm={d} readdir={d}{s}\n", .{
-        file_count,
-        file_count,
-        ref_count,
-        if (file_count == ref_count) "  byte/count match" else "  MISMATCH",
-    });
-    var b: [10][48]u8 = undefined;
-    try w.print("  serial count  {s} median · {s} best  (libc readdir, count only)\n", .{
-        fmtDur(medianOf(&ref_times), &b[0]),
-        fmtDur(minOf(&ref_times), &b[1]),
-    });
-    try w.print("  cold snapshot {s} median · {s} best\n", .{
-        fmtDur(cold_med, &b[2]),
-        fmtDur(minOf(&cold_times), &b[3]),
-    });
-    try w.print("  warm snapshot {s} median · {s} best\n", .{
-        fmtDur(warm_med, &b[4]),
-        fmtDur(minOf(&warm_times), &b[5]),
-    });
-    try w.print("    validate    {s} median  ({d} fstat/fstatat)\n", .{
-        fmtDur(medianOf(&validation_times), &b[6]),
-        stats.directories,
-    });
-    try w.print("    materialize {s} median  ({d} path bytes)\n", .{
-        fmtDur(medianOf(&materialize_times), &b[7]),
-        stats.path_bytes,
-    });
-    try w.print("  cold syscalls getdirentries={d} dirent_bytes={d} dirs={d} entries={d}\n", .{
-        walk.getdirentries_calls,
-        walk.dirent_bytes,
-        walk.directories,
-        walk.entries_seen,
-    });
-    try w.print("  cache memory  {d:.2} MiB retained\n", .{
-        @as(f64, @floatFromInt(stats.retained_bytes)) / (1024.0 * 1024.0),
-    });
-    try w.print("  repeat speed  {d:.2}x{s}\n", .{
-        repeat_speedup,
-        if (repeat_speedup < 1.0) "  (tree too small to benefit)" else "",
-    });
-    try w.writeAll("\n  Network/model timing is not synthesized: no paid request is made.\n");
-    try w.writeAll("  FX_COMPANION_NO_CACHE=1 disables snapshots; FX_NO_COMPANION=1 disables all acceleration.\n");
-    out.* = aw.toArrayList();
-}
+// Benchmarking and profiling live under benchmarks/ and are never injected into fx.
 
 fn isIgnoredName(ignored: []const []const u8, name: []const u8) bool {
     for (ignored) |entry| {
@@ -1676,6 +1355,8 @@ const State = struct {
     candidate_cap: usize,
     max_rel: usize,
     stop_requested: ?*std.atomic.Value(bool),
+    participants: usize,
+    buffer_bytes: usize,
 
     root_fd: c_int,
     paths: *std.ArrayList([]const u8),
@@ -1848,6 +1529,7 @@ pub fn walkPaths(
 
         // Disk path: load + validate with no shared mutation, then install
         // under a short lock (pointer swap + materialize only).
+        const had_disk_snapshot = diskSnapshotExists(key.bytes[0..key.len]);
         if (loadDiskSnapshotStaged(&key)) |staged_value| {
             var staged = staged_value;
             var installed = false;
@@ -1892,6 +1574,8 @@ pub fn walkPaths(
             cache.mu.lock();
             if (cacheKeyMatches(cache, &key)) cache.clearLocked();
             cache.mu.unlock();
+        } else if (had_disk_snapshot) {
+            deleteDiskSnapshot(key.bytes[0..key.len]);
         }
         if (candidate_cap <= STOCK_FIRST_CAP) {
             return true;
@@ -2027,6 +1711,8 @@ fn walkPathsUncached(
         .candidate_cap = candidate_cap,
         .max_rel = max_relative_path_bytes,
         .stop_requested = stop_requested,
+        .participants = 1,
+        .buffer_bytes = TraversalPolicy.large_buffer,
         .root_fd = root_fd,
         .paths = out_paths,
         .validation_dirs = validation_dirs,
@@ -2040,17 +1726,23 @@ fn walkPathsUncached(
     // measurable on large ones; growth beyond this stays geometric.
     out_paths.ensureUnusedCapacity(arena, 4096) catch {};
 
-    // Seed scan on this thread; queued subtrees go to the pool.
-    const seed_buffer = std.heap.c_allocator.alloc(u8, BUF_SIZE) catch return error.CompanionUnavailable;
+    // Seed scan on this thread; queued subtrees reveal enough workload shape
+    // to select the measured worker count and buffer size for the rest.
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const seed_buffer = std.heap.c_allocator.alloc(u8, TraversalPolicy.seedBufferBytes()) catch return error.CompanionUnavailable;
     defer std.heap.c_allocator.free(seed_buffer);
     scan(&st, root_fd, "", seed_buffer);
 
     st.mu.lock();
     st.done = st.pending.items.len == 0;
     const seed_only = st.pending.items.len == 0;
+    const pending_after_seed = st.pending.items.len;
     st.mu.unlock();
 
-    var threads: [WORKERS - 1]std.Thread = undefined;
+    const policy = TraversalPolicy.forWalk(cpu_count, performanceCoreCount(), pending_after_seed);
+    st.participants = policy.participants;
+    st.buffer_bytes = policy.buffer_bytes;
+    var threads: [MAX_WORKERS - 1]std.Thread = undefined;
     var started: usize = 0;
     defer {
         st.mu.lock();
@@ -2075,7 +1767,7 @@ fn walkPathsUncached(
         return incomplete;
     }
     var all_spawned = true;
-    for (&threads) |*t| {
+    for (threads[0 .. st.participants - 1]) |*t| {
         t.* = std.Thread.spawn(.{}, workerMain, .{&st}) catch {
             all_spawned = false;
             break;
@@ -2083,7 +1775,7 @@ fn walkPathsUncached(
         started += 1;
     }
     if (all_spawned) {
-        // The main thread is the WORKERS-th pool participant.
+        // The main thread is the final pool participant.
         workerMain(&st);
     } else {
         // A spawn failed: shut the partial pool down cleanly, then drain
@@ -2095,7 +1787,7 @@ fn walkPathsUncached(
         st.mu.unlock();
         for (threads[0..started]) |t| t.join();
         started = 0;
-        const wb = std.heap.c_allocator.alloc(u8, BUF_SIZE) catch return error.CompanionUnavailable;
+        const wb = std.heap.c_allocator.alloc(u8, policy.buffer_bytes) catch return error.CompanionUnavailable;
         defer std.heap.c_allocator.free(wb);
         while (true) {
             if (st.stop_now.load(.acquire)) break;
@@ -2126,7 +1818,7 @@ fn walkPathsUncached(
 }
 
 fn workerMain(st: *State) void {
-    const buffer = std.heap.c_allocator.alloc(u8, BUF_SIZE) catch {
+    const buffer = std.heap.c_allocator.alloc(u8, st.buffer_bytes) catch {
         st.failAndWake();
         return;
     };
@@ -2148,7 +1840,7 @@ fn takeJob(st: *State) ?[:0]u8 {
             return st.pending.pop().?;
         }
         st.idle += 1;
-        if (st.idle == WORKERS) {
+        if (st.idle == st.participants) {
             st.done = true;
             st.cond.broadcast();
             return null;

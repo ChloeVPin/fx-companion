@@ -22,7 +22,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     const root = args.next() orelse return error.MissingRoot;
-    const clear = if (args.next()) |flag| std.mem.eql(u8, flag, "--clear") else false;
+    const mode = args.next();
+    const clear = if (mode) |flag| std.mem.eql(u8, flag, "--clear") else false;
+    const allow_cold = if (mode) |flag| std.mem.eql(u8, flag, "--allow-cold") else false;
     if (!companion.active()) return error.CompanionInactive;
 
     if (clear) companion.clearSnapshotCache();
@@ -40,7 +42,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const hit = companion.lastCacheObservation().hit;
     if (clear and hit) return error.UnexpectedColdHit;
-    if (!clear and !hit) return error.MissingDiskHit;
+    if (!clear and !allow_cold and !hit) return error.MissingDiskHit;
     std.debug.print("git-cache {s} hit={} paths={d} elapsed_ms={d:.3}\n", .{
         if (clear) "cold" else "disk",
         hit,

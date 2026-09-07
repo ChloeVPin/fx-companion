@@ -6,30 +6,38 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      tag: ${{ steps.package.outputs.tag }}
+      asset: ${{ steps.package.outputs.asset }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Zig
         run: |
-          # Try ziglang.org first, fall back to Homebrew.
-          URL="https://ziglang.org/download/0.16.0/zig-macos-aarch64-0.16.0.tar.xz"
-          if curl -fsSL -A "OpenAI File Downloader, XaiImageApiFetch/1.0" "$URL" -o /tmp/zig.tar.xz 2>/dev/null; then
-            mkdir -p /usr/local/opt/zig
-            tar -xJf /tmp/zig.tar.xz -C /usr/local/opt/zig --strip-components=1
-            echo "/usr/local/opt/zig" >> "$GITHUB_PATH"
-          else
-            brew install zig
-          fi
+          set -euo pipefail
+          URL="https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz"
+          SHA256="b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+          curl --fail --silent --show-error --location \
+            -A "OpenAI File Downloader, XaiImageApiFetch/1.0" \
+            "$URL" -o /tmp/zig.tar.xz
+          printf '%s  %s\n' "$SHA256" /tmp/zig.tar.xz | shasum -a 256 -c -
+          mkdir -p /usr/local/opt/zig
+          tar -xJf /tmp/zig.tar.xz -C /usr/local/opt/zig --strip-components=1
+          echo "/usr/local/opt/zig" >> "$GITHUB_PATH"
           zig version
 
       - name: Pin upstream fx
@@ -42,8 +50,61 @@ jobs:
       - name: Clone upstream fx
         run: git -c http.userAgent="OpenAI File Downloader, XaiImageApiFetch/1.0" clone https://github.com/vercel-labs/fx fx-src && git -C fx-src checkout "${{ steps.pin.outputs.commit }}"
 
+      - name: Build pristine pinned workspace fingerprint
+        run: |
+          set -euo pipefail
+          cp benchmarks/workspace_dump.zig fx-src/src/fx_companion_workspace_dump.zig
+          (
+            cd fx-src
+            zig build-exe src/fx_companion_workspace_dump.zig -lc -OReleaseFast -femit-bin=/tmp/workspace-dump-pristine
+          )
+
       - name: Inject booster
-        run: python3 product/inject_hook.py fx-src
+        run: |
+          set -euo pipefail
+          python3 product/inject_hook.py fx-src
+          (
+            cd fx-src
+            zig build-exe src/fx_companion_workspace_dump.zig -lc -OReleaseFast -femit-bin=/tmp/workspace-dump-injected
+          )
+
+      - name: Pristine vs injected workspace fingerprints
+        run: |
+          set -euo pipefail
+          ROOT=$(mktemp -d /tmp/fxc-release-diff-root.XXXXXX)
+          CACHE=$(mktemp -d /tmp/fxc-release-diff-cache.XXXXXX)
+          trap 'rm -rf -- "$ROOT" "$CACHE"' EXIT
+
+          mkdir -p "$ROOT/src/deep" "$ROOT/vendor/pkg" "$ROOT/.hidden/deep"
+          printf 'alpha\n' > "$ROOT/a.txt"
+          printf 'beta\n' > "$ROOT/src/deep/b.txt"
+          printf 'ignored\n' > "$ROOT/vendor/pkg/ignored.txt"
+          printf 'hidden\n' > "$ROOT/.hidden/deep/secret.txt"
+          printf 'vendor/\n' > "$ROOT/.gitignore"
+          ln -s a.txt "$ROOT/link_to_a"
+          git -C "$ROOT" init -q
+          git -C "$ROOT" add -- .gitignore a.txt src .hidden link_to_a
+          git -C "$ROOT" -c user.email=fxc@test -c user.name=fxc -c commit.gpgsign=false commit -qm init
+
+          pristine_git="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-pristine "$ROOT" git 100000 2>&1)"
+          injected_git_cold="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-injected "$ROOT" git 100000 2>&1)"
+          test -n "$(find "$CACHE/snapshots" -maxdepth 1 -type f -print -quit 2>/dev/null)"
+          injected_git_warm="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-injected "$ROOT" git 100000 2>&1)"
+          test "$pristine_git" = "$injected_git_cold"
+          test "$pristine_git" = "$injected_git_warm"
+
+          rm -rf "$CACHE" && mkdir -p "$CACHE"
+          pristine_recursive="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-pristine "$ROOT" recursive 600000 2>&1)"
+          injected_recursive_cold="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-injected "$ROOT" recursive 600000 2>&1)"
+          test -n "$(find "$CACHE/snapshots" -maxdepth 1 -type f -print -quit 2>/dev/null)"
+          injected_recursive_warm="$(FX_COMPANION_HOME="$CACHE" /tmp/workspace-dump-injected "$ROOT" recursive 600000 2>&1)"
+          test "$pristine_recursive" = "$injected_recursive_cold"
+          test "$pristine_recursive" = "$injected_recursive_warm"
+
+          printf 'git fingerprint: %s\n' "$pristine_git"
+          printf 'git warm fingerprint: %s\n' "$injected_git_warm"
+          printf 'recursive fingerprint: %s\n' "$pristine_recursive"
+          printf 'recursive warm fingerprint: %s\n' "$injected_recursive_warm"
 
       - name: Installer smoke test
         run: node product/cli_smoke_test.js
@@ -52,7 +113,18 @@ jobs:
         run: |
           node --check cli.js
           npm pack --dry-run --json > /tmp/fxc-npm-pack.json
-          grep -q 'cli.js' /tmp/fxc-npm-pack.json
+          node - <<'NODE'
+          const packs = require('/tmp/fxc-npm-pack.json');
+          const files = new Set(packs[0].files.map((entry) => entry.path));
+          for (const required of [
+            'cli.js', 'PINNED_FX', 'product/fx_companion.zig',
+            'product/inject_hook.py', 'product/fxc',
+            'product/tests_fxcompanion.zig', 'product/install.sh',
+            'product/sync.sh',
+          ]) {
+            if (!files.has(required)) throw new Error(`npm package missing ${required}`);
+          }
+          NODE
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             PACKAGE_TAG="v$(node -p "require('./package.json').version")"
             test "$PACKAGE_TAG" = "$GITHUB_REF_NAME"
@@ -64,22 +136,22 @@ jobs:
           cp product/tests_fxcompanion.zig fx-src/src/tests_fxcompanion.zig
           cp benchmarks/concurrent_cache_probe.zig fx-src/src/fx_companion_concurrent_cache_probe.zig
           cp benchmarks/cancellation_probe.zig fx-src/src/fx_companion_cancellation_probe.zig
-          cp benchmarks/profile_output_probe.zig fx-src/src/fx_companion_profile_output_probe.zig
           cp benchmarks/git_cache_probe.zig fx-src/src/fx_companion_git_cache_probe.zig
+          cp benchmarks/tooling/benchmark_runner.zig fx-src/src/fx_companion_benchmark_runner.zig
+          cp benchmarks/tooling/profile_run.zig fx-src/src/fx_companion_profile_run.zig
           cd fx-src
           zig build-exe src/tests_fxcompanion.zig -lc -OReleaseFast -femit-bin=/tmp/equiv-probe
           zig build-exe src/fx_companion_concurrent_cache_probe.zig -lc -OReleaseFast -femit-bin=/tmp/concurrent-cache-probe
           zig build-exe src/fx_companion_cancellation_probe.zig -lc -OReleaseFast -femit-bin=/tmp/cancellation-probe
-          zig build-exe src/fx_companion_profile_output_probe.zig -lc -OReleaseFast -femit-bin=/tmp/profile-output-probe
           zig build-exe src/fx_companion_git_cache_probe.zig -lc -OReleaseFast -femit-bin=/tmp/git-cache-probe
+          zig build-exe src/fx_companion_benchmark_runner.zig -lc -OReleaseFast -femit-bin=/tmp/benchmark-runner
+          zig build-exe src/fx_companion_profile_run.zig -lc -OReleaseFast -femit-bin=/tmp/profile-runner
 
           TINY=$(mktemp -d /tmp/fxc-tiny.XXXXXX)
           CAPPED=$(mktemp -d /tmp/fxc-capped.XXXXXX)
           EMPTY=$(mktemp -d /tmp/fxc-empty.XXXXXX)
           DEEP=$(mktemp -d /tmp/fxc-deep.XXXXXX)
-          PROFILE_PARENT=$(mktemp -d /tmp/fxc-profile.XXXXXX)
-          PROFILE_LARGE="$PROFILE_PARENT/tree"
-          trap 'rm -rf -- "$TINY" "$CAPPED" "$EMPTY" "$DEEP" "$PROFILE_PARENT"' EXIT
+          trap 'rm -rf -- "$TINY" "$CAPPED" "$EMPTY" "$DEEP"' EXIT
 
           mkdir -p "$TINY/src/deep" "$TINY/node_modules/pkg" \
                    "$TINY/.hidden/deep" "$TINY/ignored/deep"
@@ -109,8 +181,6 @@ jobs:
             done
             touch leaf.txt
           )
-          /tmp/make-anchor "$PROFILE_LARGE" 101 100
-
           /tmp/equiv-probe "$TINY" 100000 --mutation-check
           /tmp/equiv-probe "$CAPPED" 50 --mutation-check
           /tmp/equiv-probe "$EMPTY" 0
@@ -119,15 +189,15 @@ jobs:
           /tmp/equiv-probe /opt/homebrew 600000
           /tmp/concurrent-cache-probe "$TINY" 1000
           /tmp/cancellation-probe /opt/homebrew 100
-          /tmp/profile-output-probe "$TINY" --require-full
-          /tmp/profile-output-probe "$PROFILE_LARGE" --require-responsive
+          /tmp/profile-runner "$TINY"
           /tmp/git-cache-probe "$TINY" --clear
           /tmp/git-cache-probe "$TINY"
           rm -f src/tests_fxcompanion.zig \
                 src/fx_companion_concurrent_cache_probe.zig \
                 src/fx_companion_cancellation_probe.zig \
-                src/fx_companion_profile_output_probe.zig \
-                src/fx_companion_git_cache_probe.zig
+                src/fx_companion_git_cache_probe.zig \
+                src/fx_companion_benchmark_runner.zig \
+                src/fx_companion_profile_run.zig
 
       - name: Build (ReleaseFast)
         run: cd fx-src && zig build -Doptimize=ReleaseFast
@@ -137,7 +207,7 @@ jobs:
           BENCH_TREE=$(mktemp -d /tmp/fxc-benchmark.XXXXXX)
           trap 'rm -rf -- "$BENCH_TREE"' EXIT
           /tmp/make-anchor "$BENCH_TREE/tree" 1024 100
-          fx-src/zig-out/bin/fx --fx-companion-benchmark "$BENCH_TREE/tree" 2>&1 | tee /tmp/fxc-benchmark.txt
+          /tmp/benchmark-runner "$BENCH_TREE/tree" 2>&1 | tee /tmp/fxc-benchmark.txt
           grep -q 'correctness: PASS' /tmp/fxc-benchmark.txt
           if grep -q 'boosted LOST' /tmp/fxc-benchmark.txt; then
             echo 'boosted implementation lost the median comparison' >&2
@@ -145,23 +215,84 @@ jobs:
           fi
 
       - name: Package
+        id: package
         run: |
+          set -euo pipefail
           cp fx-src/zig-out/bin/fx fx
           chmod +x fx
-          TAG="${GITHUB_REF_NAME:-v0.0.0-dev}"
-          tar -czf "fx-boosted-macos-arm64-${TAG}.tar.gz" fx
-          shasum -a 256 "fx-boosted-macos-arm64-${TAG}.tar.gz" > SHA256SUMS
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          TAG="${GITHUB_REF_NAME:-dev}"
+          ASSET="fx-boosted-macos-arm64-${TAG}.tar.gz"
+          tar -czf "$ASSET" fx
+          shasum -a 256 "$ASSET" > SHA256SUMS
+          {
+            echo "fx-companion release provenance"
+            echo "release_tag=$TAG"
+            echo "companion_commit=$GITHUB_SHA"
+            echo "upstream_fx_commit=$(tr -d '[:space:]' < PINNED_FX)"
+            echo "zig_version=$(zig version)"
+            echo "zig_archive_sha256=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+            echo "asset_sha256=$(awk '{print $1}' SHA256SUMS)"
+          } > PROVENANCE.txt
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
-      - name: Upload release assets
+      - name: Attest release binary
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: ${{ steps.package.outputs.asset }}
+
+      - name: Preserve release assets for publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ steps.package.outputs.asset }}
+            SHA256SUMS
+            PROVENANCE.txt
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build outputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Publish immutable release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          ASSET: ${{ needs.build.outputs.asset }}
         run: |
+          set -euo pipefail
+          test "$TAG" = "$GITHUB_REF_NAME"
+          test -f "release-assets/$ASSET"
+          test -f release-assets/SHA256SUMS
+          test -f release-assets/PROVENANCE.txt
+          (cd release-assets && shasum -a 256 -c SHA256SUMS)
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists; refusing to overwrite immutable assets" >&2
+            exit 1
+          fi
+          cp release-assets/PROVENANCE.txt /tmp/release-notes.txt
+          printf '\nBuild provenance is also recorded as a GitHub artifact attestation for the release tarball.\n' >> /tmp/release-notes.txt
           gh release create "$TAG" \
-            "fx-boosted-macos-arm64-${TAG}.tar.gz" SHA256SUMS \
             -R "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
             --title "$TAG — boosted fx (auto-built)" \
-            --notes "Built in CI from vercel-labs/fx@$(cat PINNED_FX) with the booster injected. Equivalence self-test passed before packaging." \
-            || gh release upload "$TAG" \
-            "fx-boosted-macos-arm64-${TAG}.tar.gz" SHA256SUMS \
-            -R "$GITHUB_REPOSITORY" --clobber
+            --notes-file /tmp/release-notes.txt
+          gh release upload "$TAG" \
+            "release-assets/$ASSET" \
+            release-assets/SHA256SUMS \
+            release-assets/PROVENANCE.txt \
+            -R "$GITHUB_REPOSITORY"
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false

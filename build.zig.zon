@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x4de05b330d87301c,
     .name = .fx_companion,
-    .version = "0.0.1",
+    .version = "0.4.0",
     .minimum_zig_version_string = "0.16.0",
     .paths = .{
         "build.zig",

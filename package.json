@@ -1,6 +1,6 @@
 {
   "name": "fx-companion",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Unofficial Apple Silicon accelerator for fx. Caches git ls-files and sorted walks. Stock-identical output.",
   "license": "Apache-2.0",
   "bin": {
@@ -15,5 +15,14 @@
     "url": "git+https://github.com/ChloeVPin/fx-companion.git"
   },
   "keywords": ["fx", "apple-silicon", "macos", "zig", "cli", "git"],
-  "files": ["cli.js"]
+  "files": [
+    "cli.js",
+    "PINNED_FX",
+    "product/fx_companion.zig",
+    "product/inject_hook.py",
+    "product/fxc",
+    "product/tests_fxcompanion.zig",
+    "product/install.sh",
+    "product/sync.sh"
+  ]
 }

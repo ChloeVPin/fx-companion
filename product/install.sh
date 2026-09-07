@@ -14,18 +14,10 @@ command -v git >/dev/null || { echo "install: git is required"; exit 1; }
 
 bash "$HERE/sync.sh"
 
-# Retire a stock executable only after the pinned source build and equivalence
-# gate have passed. A failed install therefore leaves the user's existing fx
-# command intact. User data in ~/.fx is untouched.
-for old in "$HOME/.local/bin/fx" "/usr/local/bin/fx"; do
-  if [ -f "$old" ] && [ ! -L "$old" ]; then
-    mv "$old" "$old.stock.bak" && echo "install: retired previous $old (backup at $old.stock.bak)"
-  fi
-done
-
 echo
 echo "Activate (one time):"
 echo "  export PATH=\"$FXC_HOME/bin:\$PATH\"   # add to your shell profile"
+echo "Existing fx executables are never moved or replaced by this installer."
 echo
 echo "After any \`fx upgrade\`, re-attach the booster:"
 echo "  $FXC_HOME/fxc sync"

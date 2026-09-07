@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # One-command installer for fx-companion:
 #
-#   curl -fsSL https://raw.githubusercontent.com/ChloeVPin/fx-companion/main/bootstrap.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/ChloeVPin/fx-companion/v0.4.0/bootstrap.sh | sh
 #
 # Fetches the booster payload and hands off to the real installer.
 set -euo pipefail
 
 REPO="ChloeVPin/fx-companion"
-BRANCH="main"
-BASE="https://raw.githubusercontent.com/$REPO/$BRANCH/product"
-ROOT_BASE="https://raw.githubusercontent.com/$REPO/$BRANCH"
+VERSION="0.4.0"
+REF="v$VERSION"
+BASE="https://raw.githubusercontent.com/$REPO/$REF/product"
+ROOT_BASE="https://raw.githubusercontent.com/$REPO/$REF"
 USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -20,7 +21,7 @@ command -v zig >/dev/null || {
   exit 1
 }
 
-for f in fx_companion.zig inject_hook.py fxc tests_fxcompanion.zig install.sh sync.sh benchmark_runner.zig profile_run.zig; do
+for f in fx_companion.zig inject_hook.py fxc tests_fxcompanion.zig install.sh sync.sh; do
   echo "bootstrap: fetching $f"
   curl -fsSL -A "$USER_AGENT" "$BASE/$f" -o "$TMP/$f"
 done
